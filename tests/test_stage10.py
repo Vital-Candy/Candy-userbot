@@ -12,6 +12,7 @@ from modules.permissions.module import PermissionsModule
 from modules.storage.labels import LabelsModule
 from modules.spam.module import SpamModule
 from modules.system.accounts import AccountsModule
+from modules.utility.mute import MuteModule
 from modules.utility.ping import PingModule
 from modules.utility.purge import PurgeModule
 from modules.utility.tag import TagModule
@@ -26,7 +27,7 @@ from modules.system.update import UpdateModule
 EXPECTED = {
     "help", "stop", "status", "account", "backup", "plugin", "update", "perm",
     "label", "labels", "goto", "unlabel", "restart", "spam",
-    "user", "ping", "tag", "purge", "setprefix",
+    "user", "ping", "tag", "purge", "setprefix", "mute",
 }
 # В ответах Telegram включён Markdown: эти символы сломали бы или исказили справку.
 MARKDOWN = re.compile(r"[*`]|~~|__|\]\(")
@@ -35,7 +36,7 @@ MARKDOWN = re.compile(r"[*`]|~~|__|\]\(")
 async def build() -> tuple[Dispatcher, list[str]]:
     """Диспетчер со всеми встроенными командами; второй результат: тексты ответов."""
     dispatcher = Dispatcher()
-    plugin_data = SimpleNamespace(get=lambda **kw: None)
+    plugin_data = SimpleNamespace(get=lambda **kw: None, delete=lambda **kw: False, set=lambda **kw: None)
     app = SimpleNamespace(
         dispatcher=dispatcher, access=None, storage=SimpleNamespace(plugin_data=plugin_data),
         identity=SimpleNamespace(account_id=AsyncMock(return_value=1)),
@@ -43,7 +44,7 @@ async def build() -> tuple[Dispatcher, list[str]]:
     register_commands(dispatcher, AsyncMock())
     for module in (
         StatusModule, AccountsModule, BackupModule, PluginsModule, UpdateModule,
-        RestartModule, SpamModule, UserModule, PingModule, TagModule, PurgeModule, PrefixModule, PermissionsModule, LabelsModule,
+        RestartModule, SpamModule, UserModule, PingModule, TagModule, PurgeModule, MuteModule, PrefixModule, PermissionsModule, LabelsModule,
     ):
         await module(app).start()
     return dispatcher, []

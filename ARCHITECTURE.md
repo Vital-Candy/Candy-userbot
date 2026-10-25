@@ -61,7 +61,7 @@ CandyUserbot/
 │   ├── storage/          # .label, .labels, .goto, .unlabel
 │   ├── clock/            # .time: часы в имени (styles, service, module)
 │   ├── spam/             # .spam: повтор сообщения с паузой (parser, module)
-│   ├── utility/          # .user, .ping, .tag, .purge (text, user, ping, tag, purge)
+│   ├── utility/          # .user, .ping, .tag, .purge, .mute (text, user, ping, tag, purge, mute)
 │   └── permissions/
 ├── storage/              # database, models, labels, permissions, service, migrations/
 ├── plugins/              # только пользовательские плагины
