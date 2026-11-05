@@ -518,6 +518,20 @@ class PolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await self.allowed("a_admin", 100))
         self.assertTrue(await self.allowed("a_user", 100))
 
+    async def test_two_messages_at_once_pass_only_once(self):
+        import asyncio
+
+        events = [make_event(".a_user", sender=100, out=False) for _ in range(2)]
+        self.fx.clock[0] += 10
+        await asyncio.gather(*(self.dispatcher.dispatch_command(event, incoming=True) for event in events))
+        self.assertEqual(len(self.calls), 1)
+
+    async def test_set_levels_is_all_or_nothing(self):
+        with self.assertRaises(ValueError):
+            await self.policy.set_levels(["a_user", "nothing"], PermissionLevel.ADMIN)
+        self.assertEqual(self.dispatcher.level_overrides, {})
+        self.assertEqual(await self.policy.set_levels(["a_user", ".A_ADMIN", "a_user"], PermissionLevel.TRUSTED), ["a_user", "a_admin"])
+
     async def test_gate_error_denies(self):
         async def broken(event, command):
             raise RuntimeError("база недоступна")
@@ -659,11 +673,11 @@ class PermAccessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.dispatcher.level_overrides, {})
 
     async def test_owner_changes_command_levels(self):
-        self.assertIn("уровень trusted", await self.run_cmd(".perm cmd view trusted"))
+        self.assertIn("trusted и выше", await self.run_cmd(".perm cmd view trusted"))
         self.assertEqual(self.dispatcher.level_overrides, {"view": "trusted"})
         self.assertIn("вручную; по умолчанию user", await self.run_cmd(".perm cmd"))
         self.assertIn("только владелец", await self.run_cmd(".perm cmd .view owner"))
-        self.assertIn("уровень user", await self.run_cmd(".perm cmd view default"))
+        self.assertIn("user и выше", await self.run_cmd(".perm cmd view default"))
         self.assertEqual(self.dispatcher.level_overrides, {})
         await self.run_cmd(".perm cmd view admin")
         self.assertIn("Сброшены", (await self.run_cmd(".perm cmd reset")).replace("сброшены", "Сброшены"))
@@ -674,8 +688,107 @@ class PermAccessTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("команды .nothing нет", await self.run_cmd(".perm cmd nothing user"))
         self.assertIn("уровень:", await self.run_cmd(".perm cmd view root"))
         self.assertIn("уровень:", await self.run_cmd(".perm cmd view admins"))
-        self.assertIn("укажите команду", await self.run_cmd(".perm cmd view"))
+        self.assertIn("укажите команды", await self.run_cmd(".perm cmd view"))
         self.assertEqual(self.dispatcher.level_overrides, {})
+
+    # ----------------------------------------------- удобная настройка и аудит
+
+    async def test_several_commands_numbers_and_all(self):
+        async def noop(event):
+            await answer(event, "ok")
+
+        self.dispatcher.register_command("zeta", noop, level="trusted")
+        table = await self.run_cmd(".perm cmd")
+        self.assertIn("1. .perm — admin и выше", table)  # номера идут по алфавиту
+        self.assertIn("2. .view — user и выше", table)
+        self.assertIn("3. .zeta — trusted и выше", table)
+        text = await self.run_cmd(".perm cmd view, zeta admin")
+        self.assertIn("Изменено команд: 2", text)
+        self.assertEqual(self.dispatcher.level_overrides, {"view": "admin", "zeta": "admin"})
+        await self.run_cmd(".perm cmd 2 3 user")  # по номерам
+        self.assertEqual(self.dispatcher.level_overrides, {"view": "user", "zeta": "user"})
+        await self.run_cmd(".perm cmd all trusted")
+        self.assertEqual(self.dispatcher.level_overrides.get("view"), "trusted")
+        self.assertNotIn("perm", self.dispatcher.level_overrides)  # .perm в «all» не входит
+        await self.run_cmd(".perm cmd view zeta off")
+        self.assertEqual(self.dispatcher.level_overrides["view"], "owner")
+        await self.run_cmd(".perm cmd all default")
+        self.assertEqual(self.dispatcher.level_overrides, {})
+
+    async def test_bad_name_or_number_changes_nothing(self):
+        for text in (".perm cmd view nothing user", ".perm cmd view 99 user", ".perm cmd view danger user"):
+            with self.subTest(text=text):
+                reply = await self.run_cmd(text)
+                self.assertIn("❌", reply)
+                self.assertEqual(self.dispatcher.level_overrides, {})
+        self.assertIn("нет: в списке", await self.run_cmd(".perm cmd 99 user"))
+
+    async def test_perm_itself_cannot_be_lowered_below_admin(self):
+        for word in ("user", "trusted"):
+            self.assertIn("нельзя опустить", await self.run_cmd(f".perm cmd perm {word}"))
+        self.assertEqual(self.dispatcher.level_overrides, {})
+        self.assertIn("admin и выше", await self.run_cmd(".perm cmd perm admin"))
+        self.assertIn("только владелец", await self.run_cmd(".perm cmd perm owner"))
+        self.assertIsNone(await self.run_cmd(".perm list", sender=102))  # закрыта и для admin
+
+    async def test_perm_does_nothing_for_low_levels_even_if_opened_by_mistake(self):
+        self.dispatcher.level_overrides = {"perm": "user"}  # как будто база повреждена или правили руками
+        self.assertIsNone(await self.run_cmd(".perm grant 300 trusted", sender=100))
+        self.assertIsNone(self.level(300))
+
+    async def test_audit_summary_warnings_and_journal(self):
+        await self.run_cmd(".perm grant 300 trusted")
+        await self.run_cmd(".perm grant 300 user")
+        await self.run_cmd(".perm cmd view user")  # по умолчанию user: не шире
+        async def noop(event):
+            await answer(event, "ok")
+        self.dispatcher.register_command("zeta", noop, level="trusted")
+        await self.run_cmd(".perm cmd zeta user")  # шире обычного
+        self.fx.grant(301, "user")
+        self.fx.storage.permissions.grant(account_id=OWNER, subject_id=302, permission="user", granted_by=999)
+        text = await self.run_cmd(".perm audit", sender=102)  # admin тоже видит аудит
+        self.assertIn("🔎 Аудит прав", text)
+        self.assertIn("admin (2): 102, 103", text)
+        self.assertIn("trusted (2): 101, 300", text)
+        self.assertIn("настроено вручную: 2", text)
+        self.assertIn(".zeta открыта шире обычного: user вместо trusted", text)
+        self.assertIn("302: user выдал 999, у которого сейчас нет прав", text)
+        self.assertIn("выдан trusted → 300", text)
+        self.assertIn("уровень команд .zeta: user", text)
+
+    async def test_audit_is_clean_without_problems_and_limits_history(self):
+        text = await self.run_cmd(".perm audit")
+        self.assertIn("Журнал изменений пока пуст", text)
+        for number in range(12):
+            await self.run_cmd(f".perm grant {400 + number} user")
+        self.assertEqual(len((await self.run_cmd(".perm audit 3")).split("Последние изменения (3):")[1].strip().splitlines()), 3)
+        self.assertIn("(10)", await self.run_cmd(".perm audit"))
+        self.assertIn("от 1 до 50", await self.run_cmd(".perm audit 0"))
+        self.assertIn("от 1 до 50", await self.run_cmd(".perm audit 51"))
+
+    async def test_journal_is_capped_and_survives_damage(self):
+        from core.policy import MAX_AUDIT
+
+        for number in range(MAX_AUDIT + 5):
+            await self.fx.app.policy.record(OWNER, f"запись {number}")
+        history = await self.fx.app.policy.history(1000)
+        self.assertEqual(len(history), MAX_AUDIT)
+        self.assertEqual(history[-1]["what"], f"запись {MAX_AUDIT + 4}")
+        self.fx.storage.plugin_data.set(account_id=OWNER, plugin="core.access", key="audit_log", value=["мусор", {"at": 1}, {"at": "2026-01-01T00:00", "what": "ок"}])
+        self.assertEqual([item["what"] for item in await self.fx.app.policy.history()], ["ок"])
+        self.fx.storage.plugin_data.set(account_id=OWNER, plugin="core.access", key="audit_log", value="не список")
+        self.assertEqual(await self.fx.app.policy.history(), [])
+
+    async def test_audit_records_revoke_and_reset(self):
+        await self.run_cmd(".perm grant 300 trusted")
+        await self.run_cmd(".perm revoke 300")
+        await self.run_cmd(".perm cmd view admin")
+        await self.run_cmd(".perm cmd reset")
+        text = await self.run_cmd(".perm audit")
+        for expected in ("снят все уровни → 300", "сброшены ручные уровни команд (было 1)", "выдан trusted → 300"):
+            self.assertIn(expected, text)
+        await self.run_cmd(".perm revoke 300")  # ничего нет: ошибка, в журнал не попадает
+        self.assertEqual(sum("снят" in item["what"] for item in await self.fx.app.policy.history(100)), 1)
 
     async def test_changed_level_takes_effect_immediately(self):
         sender = 100  # user

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import time
 from dataclasses import dataclass, field
 
 from core.errors import UserError
@@ -27,6 +28,8 @@ PAUSE = 1.5  # секунд между сообщениями
 MAX_ALL = 300  # больше участников за раз не отмечаем
 MAX_RAND = 100
 MAX_RAND_OTHERS = 10  # потолок для людей с выданным уровнем: отметить всех они не могут
+OTHERS_PAUSE = 60.0  # секунд между отметками одного постороннего человека (отметки идут от вашего имени)
+MAX_REMEMBERED = 200  # сколько людей помнить для этой паузы
 FETCH_LIMIT = 2000  # сколько участников максимум читать из чата
 MAX_FLOOD_WAIT = 300
 EXCLUDE_FLAGS = ("-e", "-е", "--exclude")  # вторая -е написана русской буквой: так легко ошибиться
@@ -141,6 +144,8 @@ class TagModule(Module):
         self._jobs: dict[int, TagJob] = {}
         self._sleep = asyncio.sleep  # подменяется в тестах
         self._random = random.Random()
+        self._clock = time.monotonic  # подменяется в тестах
+        self._others: dict[int, float] = {}  # когда посторонний человек в последний раз запускал отметку
 
     async def start(self) -> None:
         """Регистрирует команду ``.tag``."""
@@ -178,6 +183,7 @@ class TagModule(Module):
                     raise UserError(f"Вам доступно только: .tag rand <число до {MAX_RAND_OTHERS}>")
                 if request.count > MAX_RAND_OTHERS:
                     raise UserError(f"Не больше {MAX_RAND_OTHERS} человек за раз.")
+                self._check_pause(event)
             if not getattr(event, "is_group", False):
                 raise UserError("Команда работает только в группах.")
             chat_id = int(event.chat_id)
@@ -204,6 +210,19 @@ class TagModule(Module):
             raise
         except Exception as exc:
             logger.debug("Не удалось удалить сообщение с командой .tag: %s", exc)
+
+    def _check_pause(self, event) -> None:
+        """Пауза между отметками одного постороннего человека; ``UserError``, если рано."""
+        sender = getattr(event, "sender_id", None)
+        if sender is None:
+            raise UserError("Не удалось определить, кто просит отметить.")
+        now = self._clock()
+        left = OTHERS_PAUSE - (now - self._others.get(int(sender), -OTHERS_PAUSE))
+        if left > 0:
+            raise UserError(f"Подождите ещё {int(left) + 1} с.")
+        if len(self._others) >= MAX_REMEMBERED:
+            self._others = {key: moment for key, moment in self._others.items() if now - moment < OTHERS_PAUSE}
+        self._others[int(sender)] = now
 
     async def _members(self, chat_id: int, request: TagRequest) -> list:
         """Участники чата без ботов, удалённых аккаунтов, вас самих и исключённых."""

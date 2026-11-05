@@ -1,7 +1,6 @@
 """Команды .purge и .setprefix: точность удаления, права, тишина, префикс и справка."""
 from __future__ import annotations
 
-import asyncio
 import tempfile
 import unittest
 from pathlib import Path

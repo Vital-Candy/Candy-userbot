@@ -3,10 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import re
-import tempfile
 import unittest
 from datetime import datetime, timezone
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 

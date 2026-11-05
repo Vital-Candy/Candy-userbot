@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
-import textwrap
 import unittest
 from pathlib import Path
 from types import SimpleNamespace

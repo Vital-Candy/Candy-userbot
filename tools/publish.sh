@@ -4,10 +4,15 @@
 #   bash tools/publish.sh [--dry-run] [владелец/репозиторий]             первая публикация
 #   bash tools/publish.sh --release [--dry-run] [владелец/репозиторий]   выпуск обновления
 #
-# Скрипт сам ничего не удаляет и не переписывает чужую историю. Он:
-#   1. копирует проект в НОВУЮ папку (без .git, data/, logs/, .env, кэша);
+# Скрипт не переписывает чужую историю. Он:
+#   1. копирует проект в одну постоянную рабочую папку ~/.candy-publish (без .git, data/, logs/,
+#      .env, кэша); при каждом запуске она пересоздаётся, а после успешной отправки удаляется,
+#      так что новых папок не копится. Остатки прежних запусков (~/candy-publish-ГГГГММДД-ЧЧММСС,
+#      созданные этим скриптом) тоже убираются;
 #   2. задаёт анонимного автора (имя Candy, адрес noreply GitHub);
-#   3. проверяет, что в публикуемых файлах нет секретов, адресов почты и запретных слов;
+#   3. проверяет, что в публикуемых файлах нет секретов, почты, телефонов, личных файлов и запретных
+#      слов (из ~/.candy-forbidden плюс имя и почта из настройки git и профиля GitHub: их
+#      добавлять в файл не нужно);
 #   4. отправляет код и тег версии.
 # Первая публикация: создаёт свежий репозиторий с одним коммитом. Если репозиторий уже
 # существует, скрипт останавливается: удалите его вручную на сайте (Settings, Danger Zone),
@@ -34,6 +39,7 @@
 #   PUBLISH_FORBIDDEN_FILE        другой путь к файлу запретных слов
 #   PUBLISH_WORK                  своя рабочая папка (должна не существовать)
 #   PUBLISH_ALLOW_NO_FORBIDDEN=1  не требовать файл запретных слов (не рекомендуется)
+#   PUBLISH_KEEP_WORK=1           не удалять рабочую папку после отправки
 #   PUBLISH_ALLOW_SAME_VERSION=1  при --release не требовать повышения версии
 #   PUBLISH_FROM_INSTALL=1        разрешить запуск из рабочей установки (не рекомендуется)
 
@@ -91,9 +97,35 @@ if [ "${PUBLISH_FROM_INSTALL:-0}" != "1" ] && [ -d "$SRC/data" ] \
     die "$SRC похожа на рабочую установку (в data есть сессия Telegram). Распакуйте выпуск в отдельную папку (например ~/candy-release) и запускайте скрипт оттуда: так работающий userbot не изменится до команды .update. Обойти проверку: PUBLISH_FROM_INSTALL=1."
 fi
 
-# --- Рабочая папка (всегда новая) ----------------------------------------------------
-WORK="${PUBLISH_WORK:-$HOME/candy-publish-$(date +%Y%m%d-%H%M%S)}"
-[ ! -e "$WORK" ] || die "папка $WORK уже существует; удалите её или укажите другую (PUBLISH_WORK)."
+# --- Файл запретных слов нужен до любой работы (чтобы не скачивать репозиторий зря) ----
+FORBIDDEN_FILE="${PUBLISH_FORBIDDEN_FILE:-$HOME/.candy-forbidden}"
+if [ ! -s "$FORBIDDEN_FILE" ] && [ "${PUBLISH_ALLOW_NO_FORBIDDEN:-0}" != "1" ] && [ "$DRY" -eq 0 ]; then
+    die "нет файла запретных слов $FORBIDDEN_FILE. Создайте его (по слову или регулярному выражению в строке), например:
+  printf '%s\n' 'слово1' 'слово2' > ~/.candy-forbidden"
+fi
+
+# --- Рабочая папка ---------------------------------------------------------------------
+# Одна постоянная папка: прежний запуск стирается, новые папки не накапливаются. Стереть можно
+# только то, что создал сам скрипт (внутри есть .git), и никогда не саму папку проекта.
+DEFAULT_WORK="$HOME/.candy-publish"
+WORK="${PUBLISH_WORK:-$DEFAULT_WORK}"
+if [ "$WORK" = "$DEFAULT_WORK" ]; then
+    if [ -e "$WORK" ]; then
+        [ "$WORK" != "$SRC" ] && [ -d "$WORK/.git" ] || die "$WORK уже существует, но это не рабочая папка скрипта. Удалите её вручную или укажите другую (PUBLISH_WORK)."
+        rm -rf "$WORK"
+    fi
+    # Папки прежних версий скрипта (candy-publish-ГГГГММДД-ЧЧММСС): убираем только свои коммиты автора Candy.
+    for old in "$HOME"/candy-publish-[0-9]*-[0-9]*; do
+        [ -d "$old/.git" ] || continue
+        [ "$old" != "$SRC" ] || continue
+        if [ "$(git -C "$old" log -1 --format=%an 2>/dev/null || true)" = "$AUTHOR_NAME" ]; then
+            rm -rf "$old"
+            say "Удалена прежняя рабочая папка $old."
+        fi
+    done
+else
+    [ ! -e "$WORK" ] || die "папка $WORK уже существует; удалите её или укажите другую (PUBLISH_WORK)."
+fi
 
 if [ "$MODE" = release ]; then
     # Выпуск: берём опубликованную историю и добавляем в неё один коммит.
@@ -139,7 +171,7 @@ FOUND=0
 report() { FOUND=1; printf 'НАЙДЕНО: %s\n' "$1" >&2; }
 
 # 1. Файлы, которых в публикации быть не должно.
-bad_paths="$(git -c core.quotepath=off ls-files | grep -Ei '(^|/)(data|logs)/|(^|/)\.env$|\.session|profile\.json|\.zip$|\.bak$|sqlite' || true)"
+bad_paths="$(git -c core.quotepath=off ls-files | grep -Ei '(^|/)(data|logs|downloads|backups?)/|(^|/)\.env($|\.)|\.session|profile\.json|\.zip$|\.bak$|sqlite|\.db$|\.log$|\.pem$|\.key$|\.p12$|\.pyc$|(^|/)\.candy-' | grep -Ev '(^|/)\.env\.example$' || true)"
 if [ -n "$bad_paths" ]; then
     report "личные или служебные файлы:"
     printf '%s\n' "$bad_paths" >&2
@@ -154,6 +186,16 @@ if [ -n "$secrets" ]; then
     printf '%s\n' "$secrets" >&2
 fi
 
+# 2a. Номера телефонов и api_id: «+» и 10–15 цифр, номер рядом со словом phone/телефон, api_id из 6+ цифр.
+# Исключение: заведомо выдуманный номер 998901234567, который используют тесты.
+phones="$(git grep --cached -I -n -E \
+    '\+[0-9]{10,15}|([Pp]hone|[Тт]елефон|[Тт]ел\.)[^0-9]{0,20}[0-9]{10,15}|api_id[[:space:]]*[:=][[:space:]]*['\''\"]?[0-9]{6,}' \
+    | grep -v '998901234567' || true)"
+if [ -n "$phones" ]; then
+    report "похоже на номера телефонов или api_id:"
+    printf '%s\n' "$phones" >&2
+fi
+
 # 3. Адреса электронной почты (разрешён только noreply GitHub).
 emails="$(git grep --cached -I -n -E \
     '[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+' | grep -v 'users\.noreply\.github\.com' || true)"
@@ -163,8 +205,23 @@ if [ -n "$emails" ]; then
 fi
 
 # 4. Запретные слова из ~/.candy-forbidden (в содержимом и в именах файлов).
-FORBIDDEN_FILE="${PUBLISH_FORBIDDEN_FILE:-$HOME/.candy-forbidden}"
-if [ -s "$FORBIDDEN_FILE" ]; then
+# Кроме файла, автоматически берутся слова из имени и почты в настройке git и в профиле GitHub:
+# если там настоящее имя, оно тоже не должно попасть в публикацию.
+AUTO_WORDS="$(mktemp)"
+trap 'rm -f "$AUTO_WORDS"' EXIT
+{
+    git config --global user.name 2>/dev/null || true
+    git config --global user.email 2>/dev/null | sed 's/@.*//' || true
+    if [ -z "${PUBLISH_LOGIN:-}" ] && command -v gh >/dev/null 2>&1; then
+        gh api user --jq '(.name // empty), ((.email // "") | sub("@.*"; ""))' 2>/dev/null || true
+    fi
+} | grep -oE '[[:alnum:]]{4,}' | tr '[:upper:]' '[:lower:]' \
+    | grep -Evx 'candy|vital|noreply|users|github|example|test|tester' | sort -u > "$AUTO_WORDS" || true
+CHECK_WORDS="$(mktemp)"
+trap 'rm -f "$AUTO_WORDS" "$CHECK_WORDS"' EXIT
+{ [ -s "$FORBIDDEN_FILE" ] && cat "$FORBIDDEN_FILE"; cat "$AUTO_WORDS"; } > "$CHECK_WORDS" || true
+if [ -s "$CHECK_WORDS" ]; then
+    FORBIDDEN_FILE="$CHECK_WORDS"
     words="$(git grep --cached -I -n -i -E -f "$FORBIDDEN_FILE" || true)"
     if [ -n "$words" ]; then
         report "запретные слова в файлах:"
@@ -176,16 +233,11 @@ if [ -s "$FORBIDDEN_FILE" ]; then
         printf '%s\n' "$names" >&2
     fi
 elif [ "${PUBLISH_ALLOW_NO_FORBIDDEN:-0}" != "1" ]; then
-    if [ "$DRY" -eq 1 ]; then
-        say "Предупреждение: нет файла $FORBIDDEN_FILE, проверка запретных слов пропущена."
-    else
-        die "нет файла запретных слов $FORBIDDEN_FILE. Создайте его (по слову или регулярному выражению в строке), например:
-  printf '%s\n' 'слово1' 'слово2' > ~/.candy-forbidden"
-    fi
+    say "Предупреждение: нет файла запретных слов, проверка по словам пропущена."
 fi
 
 [ "$FOUND" -eq 0 ] || die "в публикуемых файлах найдены личные данные (см. выше). Ничего не отправлено."
-say "Проверки пройдены: секретов, почты и запретных слов нет."
+say "Проверки пройдены: секретов, почты, телефонов, личных файлов и запретных слов нет."
 
 # --- Коммит и тег --------------------------------------------------------------------
 if [ "$MODE" = release ] && git diff --cached --quiet; then
@@ -203,6 +255,13 @@ fi
 say "Автор коммита: $expected"
 
 # --- Отправка ------------------------------------------------------------------------
+# После успешной отправки рабочая копия не нужна: удаляем (только стандартную папку).
+cleanup_work() {
+    if [ "$WORK" = "$DEFAULT_WORK" ] && [ "${PUBLISH_KEEP_WORK:-0}" != "1" ]; then
+        cd "$HOME" && rm -rf "$WORK"
+    fi
+}
+
 if [ "$DRY" -eq 1 ]; then
     say ""
     say "Пробный запуск: ничего не отправлено. Готовая копия: $WORK"
@@ -216,6 +275,7 @@ if [ "$MODE" = release ]; then
     say ""
     say "Готово: версия ${VERSION} опубликована. Пользователи получат её командой .update."
     say "Автоматической установки нет: работающий userbot не изменён, пока вы не выполните .update."
+    cleanup_work
     exit 0
 fi
 
@@ -229,6 +289,7 @@ gh repo create "$REPO" --public --source . --remote origin --push \
     --description "Candy Userbot: модульный Telegram userbot на Telethon"
 git push -q origin "v${VERSION}"
 
+cleanup_work
 say ""
 say "Готово: https://github.com/${REPO}"
 say "Проверьте на GitHub в Settings, Emails: включено «Keep my email addresses private» и «Block command line pushes that expose my email»."

@@ -1,12 +1,13 @@
 """Модуль команды .perm: уровни людей и уровни доступа к командам.
 
 Синтаксис: ``.perm list [id]``, ``.perm grant <id | ответом> <user|trusted|admin>``,
-``.perm revoke <id | ответом> [user|trusted|admin]``, ``.perm cmd [команда уровень | reset]``.
+``.perm revoke <id | ответом> [user|trusted|admin]``, ``.perm audit [N]``,
+``.perm cmd [<команды или номера> <уровень> | reset]``.
 
 Кто что может:
 
 * владелец (сам аккаунт): всё;
-* admin: смотреть списки, выдавать и снимать уровни user и trusted людям ниже admin. Выдавать admin,
+* admin: смотреть списки и аудит, выдавать и снимать уровни user и trusted людям ниже admin. Выдавать admin,
   трогать других admin и менять доступ к командам он не может;
 * остальные эту команду не видят.
 
@@ -26,7 +27,8 @@ USAGE = (
     ".perm list [id]\n"
     ".perm grant <id | ответом> <user|trusted|admin>\n"
     ".perm revoke <id | ответом> [user|trusted|admin]\n"
-    ".perm cmd [<команда> <user|trusted|admin|owner|default> | reset]"
+    ".perm audit [N]\n"
+    ".perm cmd [<команды или номера> <user|trusted|admin|owner|default> | reset]"
 )
 DETAILS = """\
 Кто из других людей что может. Уровни: user (самый скромный: безобидные команды вроде .ping, .help и урезанный .user) < trusted (доверенный) < admin (управляет людьми, но не аккаунтом). Уровень нужно выдать каждому человеку отдельно: у кого его нет, того userbot игнорирует. Владелец аккаунта выше всех, от этих настроек не зависит и ничем не ограничен.
@@ -39,21 +41,34 @@ DETAILS = """\
 
 Вместо ID можно ответить командой на сообщение человека: .perm grant trusted. Имена @username не поддерживаются, нужен числовой ID.
 
+Аудит:
+.perm audit — кто что имеет, какие команды открыты шире обычного, подозрительные места и последние изменения
+.perm audit <N> — то же, но последних изменений N (до 50)
+
 Доступ к командам (меняет только владелец):
-.perm cmd — какие команды открыты другим и с какого уровня
+.perm cmd — пронумерованный список: у какой команды какой уровень
 .perm cmd <команда> <user|trusted|admin> — открыть команду с этого уровня
-.perm cmd <команда> owner — закрыть команду для всех, кроме владельца
+.perm cmd tag ping user — сразу несколько команд (через пробел или запятую); уровень всегда последний
+.perm cmd 2 5 trusted — команды можно указывать номерами из списка .perm cmd
+.perm cmd all trusted — все открытые команды сразу (кроме .perm: он остаётся не ниже admin)
+.perm cmd <команда> owner (или off) — закрыть команду для всех, кроме владельца
 .perm cmd <команда> default — вернуть уровень по умолчанию
 .perm cmd reset — сбросить все ручные настройки
+Если хотя бы одно имя неверное, не меняется ничего.
 
 Открыть можно только команды, написанные с расчётом на чужие сообщения (в списке .perm cmd). Остальные, например .update, .restart, .account, .backup, .plugin, .spam, .purge, .mute, .time, останутся только у владельца при любых настройках. Ручные настройки хранятся в каталоге data и при .update не сбрасываются.
 
-Что может admin: смотреть списки, выдавать и снимать уровни user и trusted людям ниже admin. Выдать admin, тронуть другого admin или поменять доступ к командам он не может. Номер телефона в .user не показывается никому, кроме владельца.
+Что может admin: смотреть списки и аудит, выдавать и снимать уровни user и trusted людям ниже admin. Выдать admin, тронуть другого admin или поменять доступ к командам он не может. Номер телефона в .user не показывается никому, кроме владельца.
 
 Права: владелец аккаунта и admin (ограниченно, см. выше)."""
 
-OWNER_WORDS = {"owner", "владелец"}
+OWNER_WORDS = {"owner", "владелец", "off", "close", "закрыть"}
 RESET_WORDS = {"default", "reset", "по-умолчанию"}
+ALL_WORDS = {"all", "все"}
+LIST_LIMIT = 15  # сколько ID показывать в одном списке аудита
+AUDIT_DEFAULT = 10
+AUDIT_MAX = 50
+MESSAGE_LIMIT = 3800  # запас до лимита Telegram в 4096 символов
 
 
 class PermissionsModule(Module):
@@ -81,8 +96,8 @@ class PermissionsModule(Module):
     async def perm_command(self, event) -> None:
         """Разбирает ``.perm`` и вызывает нужное действие; ошибки ввода и БД отвечает текстом."""
         caller = self.app.dispatcher.caller_level(event)
-        if caller is None:
-            return
+        if caller is None or caller < PermissionLevel.ADMIN:
+            return  # запасная защита: даже если команду по ошибке открыли ниже admin, работать она не будет
         command = self.app.dispatcher.get_command(event)
         args = list(command.args) if command else []
         action = args[0].lower() if args else ""
@@ -93,6 +108,8 @@ class PermissionsModule(Module):
                 await self._grant(event, args[1:], caller)
             elif action == "revoke" and 1 <= len(args) <= 3:
                 await self._revoke(event, args[1:], caller)
+            elif action == "audit" and len(args) <= 2:
+                await self._audit(event, args[1:])
             elif action == "cmd":
                 await self._cmd(event, args[1:], caller)
             else:
@@ -134,6 +151,7 @@ class PermissionsModule(Module):
         self.app.storage.permissions.grant(
             account_id=account_id, subject_id=subject, permission=level, granted_by=await self._caller_id(event, account_id)
         )
+        await self._log(event, f"выдан {level.value} → {subject}")
         await answer(event, f"✅ {subject}: выдан уровень {level.value}.")
 
     async def _revoke(self, event, rest: list[str], caller: PermissionLevel) -> None:
@@ -154,6 +172,8 @@ class PermissionsModule(Module):
                 if done
                 else f"❌ У {subject} нет уровня {level.value}."
             )
+        if text.startswith("✅"):
+            await self._log(event, f"снят {level.value if level else 'все уровни'} → {subject}")
         await answer(event, text)
 
     async def _check_target(self, event, subject: int, level: PermissionLevel | None, caller: PermissionLevel) -> None:
@@ -175,6 +195,19 @@ class PermissionsModule(Module):
 
     # ------------------------------------------------------- доступ к командам
 
+    def _shareable(self) -> list:
+        """Открытые другим команды в стабильном порядке (по имени): по нему считаются номера в ``.perm cmd``."""
+        return sorted((item for item in self.app.dispatcher.commands.values() if item.level is not None), key=lambda item: item.name)
+
+    async def _log(self, event, text: str) -> None:
+        """Записывает изменение в журнал аудита; сбой журнала не мешает самой команде."""
+        try:
+            account_id = await self.app.access.account_id()
+            by = await self._caller_id(event, account_id)
+            await self.app.policy.record(by, text)
+        except Exception:
+            logger.exception("Не удалось записать изменение в журнал .perm audit")
+
     async def _cmd(self, event, rest: list[str], caller: PermissionLevel) -> None:
         """``.perm cmd``: показывает доступ к командам; владелец ещё и меняет его."""
         if not rest:
@@ -185,11 +218,13 @@ class PermissionsModule(Module):
         policy = self.app.policy
         if len(rest) == 1 and rest[0].lower() == "reset":
             count = await policy.reset()
+            await self._log(event, f"сброшены ручные уровни команд (было {count})")
             await answer(event, f"✅ Ручные настройки сброшены (было: {count}). Действуют уровни по умолчанию.")
             return
-        if len(rest) != 2:
-            raise ValueError("укажите команду и уровень: .perm cmd <команда> <user|trusted|admin|owner|default>")
-        name, word = rest[0], rest[1].strip().lower()
+        tokens = [part for item in rest for part in item.replace(",", " ").split() if part]
+        if len(tokens) < 2:
+            raise ValueError("укажите команды и уровень: .perm cmd <команда> <user|trusted|admin|owner|default>")
+        word = tokens.pop().lower()
         if word in RESET_WORDS:
             level = None
         elif word in OWNER_WORDS:
@@ -198,29 +233,125 @@ class PermissionsModule(Module):
             level = self._parse_level(word)
             if level is None or level not in GRANTABLE:
                 raise ValueError("уровень: user, trusted, admin, owner или default")
-        await policy.set_level(name, level)
-        command = self.app.dispatcher.commands[name.strip().lower().lstrip(".")]
-        needed = self.app.dispatcher.required_level(command)
-        now = "только владелец" if needed is None else f"уровень {needed.value} и выше"
-        await answer(event, f"✅ .{command.name}: теперь {now}.")
+        names = self._command_names(tokens)
+        changed = await policy.set_levels(names, level)
+        dispatcher = self.app.dispatcher
+        lines = []
+        for name in changed:
+            needed = dispatcher.required_level(dispatcher.commands[name])
+            lines.append(f".{name}: " + ("только владелец" if needed is None else f"{needed.value} и выше"))
+        shown = ", ".join(f".{name}" for name in changed)
+        await self._log(event, f"уровень команд {shown}: {word}")
+        if len(lines) == 1:
+            await answer(event, "✅ " + lines[0].replace(": ", ": теперь ", 1) + ".")
+        else:
+            await answer(event, "✅ Изменено команд: " + str(len(lines)) + "\n" + "\n".join(lines))
+
+    def _command_names(self, tokens: list[str]) -> list[str]:
+        """Имена команд из слов и номеров; ``all`` берёт все открытые команды (кроме защищённых)."""
+        from core.policy import PROTECTED  # локально: модуль грузится раньше политики
+
+        shareable = self._shareable()
+        names: list[str] = []
+        for token in tokens:
+            if token.lower() in ALL_WORDS:
+                names += [item.name for item in shareable if item.name not in PROTECTED]
+            elif token.isdigit():
+                number = int(token)
+                if not 1 <= number <= len(shareable):
+                    raise ValueError(f"номера {number} нет: в списке .perm cmd команд {len(shareable)}")
+                names.append(shareable[number - 1].name)
+            else:
+                names.append(token)
+        return list(dict.fromkeys(names))  # без повторов, порядок сохраняется
 
     def _cmd_table(self) -> str:
-        """Таблица: какие команды открыты другим людям и с какого уровня."""
+        """Пронумерованная таблица: какие команды открыты другим людям и с какого уровня."""
         dispatcher = self.app.dispatcher
-        shareable = [item for item in dispatcher.command_help() if item.level is not None]
         closed = sorted(item.name for item in dispatcher.commands.values() if item.level is None)
         lines = ["🔐 Доступ к командам (кроме владельца):"]
-        for command in shareable:
+        for number, command in enumerate(self._shareable(), start=1):
             needed = dispatcher.required_level(command)
             now = "только владелец" if needed is None else f"{needed.value} и выше"
             manual = ""
             if command.name in dispatcher.level_overrides:
                 manual = f" (вручную; по умолчанию {command.level.value})"
-            lines.append(f".{command.name} — {now}{manual}")
+            lines.append(f"{number}. .{command.name} — {now}{manual}")
         if closed:
             lines += ["", "Только владелец, открыть нельзя: " + ", ".join("." + name for name in closed)]
-        lines += ["", "Изменить (владелец): .perm cmd <команда> <user|trusted|admin|owner|default>"]
+        lines += ["", "Изменить (владелец): .perm cmd <команды или номера> <user|trusted|admin|owner|default>"]
         return "\n".join(lines)
+
+    # ------------------------------------------------------------------ аудит
+
+    async def _audit(self, event, rest: list[str]) -> None:
+        """``.perm audit [N]``: сводка прав, подозрительные места и последние изменения."""
+        count = AUDIT_DEFAULT
+        if rest:
+            if not rest[0].isdigit() or not 1 <= int(rest[0]) <= AUDIT_MAX:
+                raise ValueError(f"N это число от 1 до {AUDIT_MAX}")
+            count = int(rest[0])
+        account_id = await self.app.access.account_id()
+        dispatcher = self.app.dispatcher
+        items = self.app.storage.permissions.list_all(account_id=account_id)
+
+        holders: dict[int, list[PermissionLevel]] = {}
+        for item in items:
+            try:
+                level = PermissionLevel(item.permission)
+            except ValueError:
+                continue
+            if level in GRANTABLE:
+                holders.setdefault(item.subject_id, []).append(level)
+        best = {subject: max(levels) for subject, levels in holders.items()}
+
+        lines = ["🔎 Аудит прав", f"Людей с уровнем: {len(best)}"]
+        for level in reversed(GRANTABLE):
+            ids = sorted(subject for subject, top in best.items() if top == level)
+            if ids:
+                shown = ", ".join(str(number) for number in ids[:LIST_LIMIT])
+                more = f" и ещё {len(ids) - LIST_LIMIT}" if len(ids) > LIST_LIMIT else ""
+                lines.append(f"{level.value} ({len(ids)}): {shown}{more}")
+
+        shareable = self._shareable()
+        manual = [item for item in shareable if item.name in dispatcher.level_overrides]
+        lines += ["", f"Команд открыто другим: {len(shareable)}, настроено вручную: {len(manual)}"]
+        for command in manual:
+            needed = dispatcher.required_level(command)
+            now = "только владелец" if needed is None else f"{needed.value} и выше"
+            lines.append(f".{command.name} — {now} (по умолчанию {command.level.value})")
+
+        warnings: list[str] = []
+        for command in manual:
+            needed = dispatcher.required_level(command)
+            if needed is not None and needed < command.level:
+                warnings.append(f".{command.name} открыта шире обычного: {needed.value} вместо {command.level.value}")
+        for subject, levels in sorted(holders.items()):
+            if len(levels) > 1:
+                warnings.append(f"{subject}: выдано несколько уровней, действует высший ({best[subject].value})")
+        known = set(best) | {account_id}
+        for item in items:
+            if item.granted_by not in known and item.subject_id in best:
+                warnings.append(f"{item.subject_id}: {item.permission} выдал {item.granted_by}, у которого сейчас нет прав")
+        stale = sorted(name for name in dispatcher.level_overrides if name not in dispatcher.commands)
+        if stale:
+            warnings.append("настройки для команд, которых сейчас нет: " + ", ".join("." + name for name in stale))
+        if len([1 for top in best.values() if top == PermissionLevel.ADMIN]) > 3:
+            warnings.append("admin больше трёх: проверьте, что все они нужны")
+        lines += ["", "Замечания:" if warnings else "Замечаний нет."] + [f"⚠️ {item}" for item in warnings[:LIST_LIMIT]]
+
+        history = await self.app.policy.history(count)
+        if history:
+            lines += ["", f"Последние изменения ({len(history)}):"]
+            for record in reversed(history):
+                moment = record["at"].replace("T", " ")[:16]
+                lines.append(f"{moment} UTC · {record.get('by', '?')} · {record['what']}")
+        else:
+            lines += ["", "Журнал изменений пока пуст."]
+        text = "\n".join(lines)
+        if len(text) > MESSAGE_LIMIT:
+            text = text[:MESSAGE_LIMIT].rsplit("\n", 1)[0] + "\n… (обрезано, уменьшите N)"
+        await answer(event, text)
 
     # ----------------------------------------------------------------- parsing
 

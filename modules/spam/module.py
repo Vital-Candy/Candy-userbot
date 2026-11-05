@@ -16,7 +16,6 @@ from modules.spam.parser import (
     DEFAULT_DELAY,
     MAX_COUNT,
     MIN_DELAY,
-    USAGE,
     SpamRequest,
     parse_spam,
 )

@@ -136,6 +136,76 @@ class PublishScriptTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("секреты", result.stderr)
 
+    def test_phone_number_and_api_id_block_publication(self) -> None:
+        # Строки собираются по частям: иначе сам тест выглядел бы как утечка и блокировал публикацию.
+        for text in ("звоните +7916" + "1234567\n", "phone = 7916" + "1234567\n", "api_id = 12345" + "67\n"):
+            with self.subTest(text=text):
+                (self.src / "NOTES.md").write_text(text, encoding="utf-8")
+                shutil.rmtree(self.work, ignore_errors=True)
+                result = self.run_publish("--dry-run")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("номера телефонов", result.stderr)
+        (self.src / "NOTES.md").write_text("пример: phone=998901234567 и api_id=12345\n", encoding="utf-8")
+        shutil.rmtree(self.work, ignore_errors=True)
+        self.assertEqual(self.run_publish("--dry-run").returncode, 0)  # выдуманный номер тестов и короткий id разрешены
+
+    def test_personal_files_block_publication(self) -> None:
+        for name in ("dump.db", "candy.log", "key.pem", "downloads/photo.jpg", ".env.local"):
+            with self.subTest(name=name):
+                target = self.src / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("x", encoding="utf-8")
+                shutil.rmtree(self.work, ignore_errors=True)
+                result = self.run_publish("--dry-run")
+                self.assertNotEqual(result.returncode, 0, name)
+                self.assertIn("личные или служебные файлы", result.stderr)
+                target.unlink()
+
+    def test_name_from_git_config_is_forbidden_automatically(self) -> None:
+        gitconfig = self.tmp / "gitconfig"
+        gitconfig.write_text("[user]\n\tname = Zxcv" + "bnm Qwer" + "ty\n\temail = zxcv" + "bnm.q@example" + ".org\n", encoding="utf-8")
+        env = {"GIT_CONFIG_GLOBAL": str(gitconfig)}
+        self.assertEqual(self.run_publish("--dry-run", extra_env=env).returncode, 0)
+        shutil.rmtree(self.work)
+        (self.src / "README.md").write_text("Автор: zxcv" + "bnm\n", encoding="utf-8")
+        result = self.run_publish("--dry-run", extra_env=env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("запретные слова", result.stderr)
+
+    def test_default_work_dir_is_reused_and_removed_after_release(self) -> None:
+        remote = self.make_remote("0.0.1")
+        self.stub_gh_for(remote)
+        default = self.home / ".candy-publish"
+        env = {"PUBLISH_WORK": ""}
+        self.assertEqual(self.run_publish("--release", "--dry-run", extra_env=env).returncode, 0)
+        self.assertTrue(default.is_dir())  # пробный запуск оставляет копию для просмотра
+        again = self.run_publish("--release", "--dry-run", extra_env=env)  # второй запуск перезаписывает ту же папку
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual([item.name for item in self.home.iterdir()], [".candy-publish"])
+        done = self.run_publish("--release", extra_env=env)
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        self.assertEqual(list(self.home.iterdir()), [])  # после отправки ничего не осталось
+
+    def test_old_publish_folders_of_this_script_are_cleaned_but_foreign_ones_stay(self) -> None:
+        mine = self.home / "candy-publish-20260101-000000"
+        theirs = self.home / "candy-publish-20260102-000000"
+        for folder, author in ((mine, "Candy"), (theirs, "Somebody")):
+            folder.mkdir()
+            subprocess.run([GIT, "init", "-q"], cwd=folder, check=True)
+            subprocess.run([GIT, "-c", f"user.name={author}", "-c", "user.email=a@users.noreply.github.com",
+                            "commit", "-q", "--allow-empty", "-m", "x"], cwd=folder, check=True)
+        result = self.run_publish("--dry-run", extra_env={"PUBLISH_WORK": ""})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(mine.exists())
+        self.assertTrue(theirs.exists())
+
+    def test_default_work_dir_that_is_not_ours_is_refused(self) -> None:
+        (self.home / ".candy-publish").mkdir()
+        (self.home / ".candy-publish" / "mine.txt").write_text("важное", encoding="utf-8")
+        result = self.run_publish("--dry-run", extra_env={"PUBLISH_WORK": ""})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue((self.home / ".candy-publish" / "mine.txt").exists())
+
     def test_real_run_requires_forbidden_file(self) -> None:
         self.forbidden.unlink()
         result = self.run_publish()

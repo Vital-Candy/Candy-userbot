@@ -192,6 +192,21 @@ class CommandsByLevelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sum(text.count("@u") for text in self.sent_tags), 5)
         event.delete.assert_not_awaited()  # чужое сообщение не удаляем
 
+    async def test_tag_pause_for_others_but_not_for_owner(self):
+        self.tag._clock = lambda: self.fx.clock[0]
+        first = await self.run_cmd(".tag rand 2", 101)
+        self.assertNotIn("❌", self.reply_text(first) or "")
+        second = await self.run_cmd(".tag rand 2", 101)  # прошло 10 с из 60
+        self.assertIn("Подождите", self.reply_text(second))
+        other = await self.run_cmd(".tag rand 2", 102)  # у другого человека своя пауза
+        self.assertNotIn("Подождите", self.reply_text(other) or "")
+        self.fx.clock[0] += 60
+        late = await self.run_cmd(".tag rand 2", 101)
+        self.assertNotIn("Подождите", self.reply_text(late) or "")
+        for _ in range(3):
+            event = await self.run_cmd(".tag rand 2", OWNER)
+            self.assertNotIn("Подождите", self.reply_text(event) or "")
+
     async def test_tag_for_owner_is_unchanged(self):
         event = await self.run_cmd(".tag all", OWNER)
         event.delete.assert_awaited()

@@ -12,7 +12,7 @@ from core.dispatcher import Dispatcher
 from core.reply import answer
 
 try:
-    from telethon.errors import FloodWaitError, MessageNotModifiedError, RPCError
+    from telethon.errors import FloodWaitError, MessageNotModifiedError
 
     from core.events import EventBridge
 except ImportError:  # Telethon не установлен
