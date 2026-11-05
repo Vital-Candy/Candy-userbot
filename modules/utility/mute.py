@@ -5,8 +5,11 @@
 
 * личный чат: удаляются все новые сообщения (и ваши, и собеседника);
 * группа без флага: только ваши новые сообщения;
-* группа с ``--all``: сообщения всех (нужны права на удаление, два подтверждения);
+* группа с ``--all``: сообщения всех, кроме ваших (нужны права на удаление, два подтверждения);
 * группа, команда ответом на сообщение: сообщения этого пользователя (нужны права на удаление).
+
+Флаг уровня ``-user``, ``-trusted`` или ``-admin`` (для ``--all`` и личного чата) оставляет право писать
+тем, у кого выдан этот уровень или выше; их сообщения не удаляются. Без флага писать может только владелец.
 
 Остановка: ответить на сообщение с командой словом ``stop`` (или «стоп»). Режимы сохраняются в
 базе и возобновляются после перезапуска userbot. Сообщения удаляются пачками (до 100 за запрос),
@@ -43,14 +46,16 @@ STOP_WORDS = frozenset({"stop", "стоп"})
 CANCEL_WORDS = frozenset({"stop", "стоп", "no", "нет", "cancel", "отмена"})
 FIRST_WORDS = frozenset({"да", "yes"})
 SECOND_WORDS = frozenset({"подтверждаю", "confirm"})
-USAGE = "Использование: .mute [длительность] [--all] | .mute off | .mute list"
+LEVEL_FLAGS = {f"{dashes}{name}": name for name in ("user", "trusted", "admin") for dashes in ("-", "--")}
+USAGE = "Использование: .mute [длительность] [--all] [-user|-trusted|-admin] | .mute off | .mute list"
 
 DETAILS = f"""\
 Тихо удаляет новые сообщения в чате, пока режим включён. Сообщение с командой остаётся в чате как «пульт»: на него отвечают, чтобы остановить режим.
 
 .mute — в личном чате удаляет все новые сообщения (и ваши, и собеседника); в группе только ваши
 .mute <длительность> — то же на время: 30s, 10m, 2h, 1d, 1h30m (число без буквы считается минутами; от {MIN_SECONDS} секунд до 365 дней). Без длительности режим работает, пока его не остановят
-.mute --all — в группе удалять сообщения всех. Проверяются права на удаление, затем нужно дважды подтвердить ответом на сообщение с командой: сначала да, потом подтверждаю
+.mute --all — в группе удалять сообщения всех, кроме ваших. Проверяются права на удаление, затем нужно дважды подтвердить ответом на сообщение с командой: сначала да, потом подтверждаю
+.mute --all -trusted — то же, но писать могут ещё и те, кому вы выдали уровень trusted или выше (admin тоже). Так же работают -user и -admin; можно и в личном чате. Кто пишет ниже указанного уровня или без выданного уровня, того сообщения удаляются. Без флага писать может только владелец
 .mute (ответом на сообщение пользователя в группе) — удалять все новые сообщения именно этого пользователя; нужны права на удаление
 .mute off — остановить режим в этом чате
 .mute list — показать все активные режимы
@@ -69,11 +74,12 @@ _UNITS = {
 
 @dataclass(slots=True, frozen=True)
 class MuteRequest:
-    """Разобранная команда: действие, длительность в секундах (None: бессрочно) и флаг ``--all``."""
+    """Разобранная команда: действие, длительность (None: бессрочно), ``--all`` и уровень «кому можно писать»."""
 
     action: str  # "start", "off", "list"
     seconds: int | None = None
     everyone: bool = False
+    allow: str | None = None  # "user", "trusted", "admin" или None: писать может только владелец
 
 
 def parse_duration(tokens: list[str]) -> int:
@@ -101,13 +107,14 @@ def parse_mute(args: list[str]) -> MuteRequest:
     if lowered == ["list"]:
         return MuteRequest("list")
     everyone = "--all" in lowered
-    rest = [item for item in args if item.lower() != "--all"]
-    if len(lowered) - len(rest) > 1:
+    levels = [LEVEL_FLAGS[item] for item in lowered if item in LEVEL_FLAGS]
+    rest = [item for item in args if item.lower() != "--all" and item.lower() not in LEVEL_FLAGS]
+    if lowered.count("--all") > 1 or len(levels) > 1:
         raise UserError(USAGE)
     if any(item.startswith("-") for item in rest) or any(item.lower() in {"off", "list"} for item in rest):
         raise UserError(USAGE)
     seconds = parse_duration(rest) if rest else None
-    return MuteRequest("start", seconds, everyone)
+    return MuteRequest("start", seconds, everyone, levels[0] if levels else None)
 
 
 def format_left(seconds: float | None) -> str:
@@ -138,6 +145,7 @@ class Mute:
     label: str = ""
     until: float | None = None  # время окончания по time.time(); None: бессрочно
     deleted: int = 0
+    allow: str | None = None  # уровень, начиная с которого писать можно ("user"/"trusted"/"admin")
     failures: int = 0
     timer: asyncio.Task | None = field(default=None, repr=False)
 
@@ -146,6 +154,7 @@ class Mute:
         return {
             "chat_id": self.chat_id, "anchor_id": self.anchor_id, "mode": self.mode,
             "target_id": self.target_id, "label": self.label, "until": self.until, "deleted": self.deleted,
+            "allow": self.allow,
         }
 
 
@@ -156,6 +165,7 @@ class Pending:
     chat_id: int
     anchor_id: int
     seconds: int | None
+    allow: str | None = None
     stage: int = 1
     timer: asyncio.Task | None = field(default=None, repr=False)
 
@@ -163,8 +173,17 @@ class Pending:
 SCOPE_TEXT = {
     "chat": "все сообщения в чате",
     "own": "только ваши сообщения",
-    "all": "сообщения всех участников",
+    "all": "сообщения всех участников, кроме ваших",
 }
+
+
+def scope_text(mute: "Mute") -> str:
+    """Описание режима для ответов; с флагом уровня добавляет, кому можно писать."""
+    who = f" ({mute.label})" if mute.label else ""
+    text = SCOPE_TEXT.get(mute.mode, f"сообщения пользователя{who}")
+    if mute.allow and mute.mode in {"chat", "all"}:
+        text += f"; писать могут {mute.allow} и выше"
+    return text
 
 
 class MuteModule(Module):
@@ -194,7 +213,7 @@ class MuteModule(Module):
             "mute",
             self.mute_command,
             description="тихо удалять новые сообщения (stop: остановить)",
-            usage=".mute [длительность] [--all] | off | list",
+            usage=".mute [длительность] [--all] [-user|-trusted|-admin] | off | list",
             priority=25,
             details=DETAILS,
         )
@@ -227,11 +246,13 @@ class MuteModule(Module):
                 mute = Mute(
                     int(record["chat_id"]), int(record["anchor_id"]), str(record["mode"]),
                     record.get("target_id"), str(record.get("label") or ""), record.get("until"),
-                    int(record.get("deleted") or 0),
+                    int(record.get("deleted") or 0), allow=record.get("allow"),
                 )
             except (KeyError, TypeError, ValueError):
                 continue
             if mute.mode not in {"chat", "own", "all", "user"}:
+                continue
+            if mute.allow not in (None, *LEVEL_FLAGS.values()):
                 continue
             if mute.until is not None and mute.until <= self._now():
                 continue
@@ -264,8 +285,7 @@ class MuteModule(Module):
         lines = ["🔇 Режимы .mute:"]
         for mute in self._active.values():
             left = None if mute.until is None else mute.until - self._now()
-            who = f" ({mute.label})" if mute.label else ""
-            scope = SCOPE_TEXT.get(mute.mode, f"сообщения пользователя{who}")
+            scope = scope_text(mute)
             lines.append(f"чат {mute.chat_id}: {scope}, {format_left(left)}, удалено {mute.deleted}")
         for pending in self._pending.values():
             lines.append(f"чат {pending.chat_id}: ждёт подтверждения (шаг {pending.stage} из 2)")
@@ -305,17 +325,21 @@ class MuteModule(Module):
             raise UserError("В этом чате режим уже включён или ждёт подтверждения. Остановить: .mute off")
         private = bool(getattr(event, "is_private", False))
         replied = getattr(event, "reply_to_msg_id", None)
+        if request.allow and not (private or request.everyone):
+            raise UserError("Флаг уровня нужен с --all или в личном чате: в других режимах чужие сообщения не удаляются.")
+        if request.allow and replied:
+            raise UserError("Флаг уровня и ответ на сообщение нельзя совмещать.")
         if private and request.everyone:
             raise UserError("Флаг --all нужен только в группах: в личном чате и так удаляется всё.")
         if request.everyone and replied:
             raise UserError("--all и ответ на сообщение нельзя совмещать: выберите что-то одно.")
 
-        mute = Mute(chat_id, anchor_id, "chat" if private else "own")
+        mute = Mute(chat_id, anchor_id, "chat" if private else "own", allow=request.allow)
         if request.seconds is not None:
             mute.until = self._now() + request.seconds
         if not private and request.everyone:
             await self._check_rights(chat_id)
-            await self._ask_confirmation(event, chat_id, anchor_id, request.seconds)
+            await self._ask_confirmation(event, chat_id, anchor_id, request.seconds, request.allow)
             return
         if not private and replied:
             await self._target_from_reply(event, mute)
@@ -353,15 +377,18 @@ class MuteModule(Module):
 
     # ------------------------------------------------------- подтверждения
 
-    async def _ask_confirmation(self, event, chat_id: int, anchor_id: int, seconds: int | None) -> None:
+    async def _ask_confirmation(
+        self, event, chat_id: int, anchor_id: int, seconds: int | None, allow: str | None = None
+    ) -> None:
         """Первое подтверждение режима ``--all``: текст появляется на месте команды."""
-        pending = Pending(chat_id, anchor_id, seconds)
+        pending = Pending(chat_id, anchor_id, seconds, allow)
         self._pending[chat_id] = pending
         pending.timer = asyncio.get_running_loop().create_task(self._confirm_timeout(pending))
         self._ensure_handler()
         await answer(
             event,
-            "⚠️ Режим --all удаляет ВСЕ новые сообщения ВСЕХ участников этой группы.\n"
+            "⚠️ Режим --all удаляет ВСЕ новые сообщения ВСЕХ участников этой группы"
+            + (f" (кроме вас и тех, у кого уровень {allow} или выше).\n" if allow else " (кроме ваших).\n") +
             "Подтверждение 1 из 2: ответьте на это сообщение словом да. Отмена: ответ стоп.",
         )
 
@@ -397,7 +424,7 @@ class MuteModule(Module):
             del self._pending[pending.chat_id]
             self._cancel_timer(pending)
             await self._delete(pending.chat_id, [event.id])
-            mute = Mute(pending.chat_id, pending.anchor_id, "all")
+            mute = Mute(pending.chat_id, pending.anchor_id, "all", allow=pending.allow)
             if pending.seconds is not None:
                 mute.until = self._now() + pending.seconds
             await self._activate(mute)
@@ -413,8 +440,7 @@ class MuteModule(Module):
         """Включает режим, сохраняет его и обновляет сообщение-«пульт»."""
         self._begin(mute)
         self._save()
-        who = f" ({mute.label})" if mute.label else ""
-        scope = SCOPE_TEXT.get(mute.mode, f"сообщения пользователя{who}")
+        scope = scope_text(mute)
         left = None if mute.until is None else mute.until - self._now()
         await self._edit(
             mute.chat_id, mute.anchor_id,
@@ -485,14 +511,29 @@ class MuteModule(Module):
             return
         if out and text.split(" ", 1)[0] == self.app.dispatcher.parser.prefix + "mute":
             return  # управление режимом не удаляем
-        if self._matches(mute, event, out):
+        if await self._matches(mute, event, out):
             self._enqueue(mute, event.id)
 
-    @staticmethod
-    def _matches(mute: Mute, event, out: bool) -> bool:
+    async def _allowed_to_write(self, mute: Mute, event) -> bool:
+        """Может ли автор писать: уровень не ниже выбранного флагом. Ошибка проверки означает «нельзя»."""
+        if mute.allow is None:
+            return False
+        sender = getattr(event, "sender_id", None)
+        access = getattr(self.app, "access", None)
+        if sender is None or access is None:
+            return False
+        try:
+            return await access.has_level(int(sender), mute.allow)
+        except Exception:
+            logger.exception(".mute: не удалось проверить уровень %s.", sender)
+            return False
+
+    async def _matches(self, mute: Mute, event, out: bool) -> bool:
         """Подлежит ли это сообщение удалению в данном режиме."""
-        if mute.mode in {"chat", "all"}:
-            return True
+        if mute.mode == "all":
+            return not out and not await self._allowed_to_write(mute, event)
+        if mute.mode == "chat":
+            return out or not await self._allowed_to_write(mute, event)
         if mute.mode == "own":
             return out
         return getattr(event, "sender_id", None) == mute.target_id

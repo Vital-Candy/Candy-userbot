@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from core.errors import UserError
 from core.module import Module
 from core.reply import answer
+from storage.permissions import PermissionLevel
 from modules.utility.text import clean
 from utils.logger import logger
 
@@ -25,6 +26,7 @@ PER_MESSAGE = 5  # отметок в одном сообщении
 PAUSE = 1.5  # секунд между сообщениями
 MAX_ALL = 300  # больше участников за раз не отмечаем
 MAX_RAND = 100
+MAX_RAND_OTHERS = 10  # потолок для людей с выданным уровнем: отметить всех они не могут
 FETCH_LIMIT = 2000  # сколько участников максимум читать из чата
 MAX_FLOOD_WAIT = 300
 EXCLUDE_FLAGS = ("-e", "-е", "--exclude")  # вторая -е написана русской буквой: так легко ошибиться
@@ -47,6 +49,8 @@ DETAILS = f"""\
 
 В -e можно писать @username, username или числовой ID, несколько через пробел. У кого есть username, ставится @username, у остальных имя со ссылкой на аккаунт. Боты, удалённые аккаунты и вы сами пропускаются.
 Отметки идут по {PER_MESSAGE} в сообщении с паузой {PAUSE:g} с, чтобы не поймать ограничение Telegram. В одном чате идёт одна отметка.
+
+Людям с выданным уровнем (по умолчанию trusted и выше) доступно только .tag rand до {MAX_RAND_OTHERS} человек без -e: .tag all и .tag stop только у владельца.
 
 Права: только владелец аккаунта."""
 
@@ -147,6 +151,7 @@ class TagModule(Module):
             usage=".tag all | rand <число> [-e @юзер ...] | stop",
             priority=30,
             details=DETAILS,
+            level=PermissionLevel.TRUSTED,
         )
 
     async def stop(self) -> None:
@@ -158,12 +163,21 @@ class TagModule(Module):
         """``.tag all|rand ...`` запускает отметку, ``.tag stop`` останавливает."""
         command = self.app.dispatcher.get_command(event)
         args = list(command.args) if command else []
+        owner = self.app.dispatcher.caller_level(event) == PermissionLevel.OWNER
         if [item.lower() for item in args] == ["stop"]:
+            if not owner:
+                await answer(event, "❌ Остановить отметку может только владелец.")
+                return
             stopped = await self._cancel_all()
             await answer(event, f"⏹ Остановлено отметок: {stopped}." if stopped else "ℹ️ Сейчас ничего не отмечается.")
             return
         try:
             request = parse_tag(args)
+            if not owner:
+                if request.mode != "rand" or request.exclude:
+                    raise UserError(f"Вам доступно только: .tag rand <число до {MAX_RAND_OTHERS}>")
+                if request.count > MAX_RAND_OTHERS:
+                    raise UserError(f"Не больше {MAX_RAND_OTHERS} человек за раз.")
             if not getattr(event, "is_group", False):
                 raise UserError("Команда работает только в группах.")
             chat_id = int(event.chat_id)
@@ -182,6 +196,8 @@ class TagModule(Module):
         job = TagJob(chat_id, messages)
         self._jobs[chat_id] = job
         job.task = asyncio.get_running_loop().create_task(self._run(job))
+        if not owner:
+            return  # чужое сообщение не трогаем: удалять его вы не вправе, да и команда не ваша
         try:
             await event.delete()  # в чате остаются только отметки
         except asyncio.CancelledError:

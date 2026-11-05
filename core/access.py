@@ -1,4 +1,4 @@
-"""Уровни доступа: кто что может делать. Сам аккаунт всегда ADMIN."""
+"""Уровни доступа: кто что может делать. Сам аккаунт всегда OWNER, остальным уровень нужно выдать."""
 from __future__ import annotations
 
 from typing import Any
@@ -19,22 +19,24 @@ class AccessService:
         """ID текущего аккаунта (делегирует в identity)."""
         return await self.identity.account_id()
 
-    async def level_of(self, subject_id: int) -> PermissionLevel:
-        """Наивысший уровень ``subject_id`` у текущего аккаунта; сам аккаунт всегда ADMIN."""
+    async def level_of(self, subject_id: int) -> PermissionLevel | None:
+        """Наивысший уровень ``subject_id``: OWNER для самого аккаунта, ``None``, если ничего не выдано."""
         account_id = await self.account_id()
         if int(subject_id) == account_id:
-            return PermissionLevel.ADMIN  # владелец: записи в базе не нужно
+            return PermissionLevel.OWNER  # владелец: записи в базе не нужно
         return self.store.highest_level(account_id=account_id, subject_id=int(subject_id))
 
     async def has_level(self, subject_id: int, level: PermissionLevel | str) -> bool:
-        """True, если уровень пользователя не ниже ``level`` (сравнение по рангу)."""
-        return await self.level_of(subject_id) >= PermissionLevel(str(level))
+        """True, если уровень пользователя не ниже ``level``; без выданного уровня всегда False."""
+        current = await self.level_of(subject_id)
+        return current is not None and current >= PermissionLevel(str(level))
 
 
 def require(app: Any, level: PermissionLevel | str) -> Filter:
     """Фильтр для команд и обработчиков: пропускает не ниже ``level``.
 
     * собственные исходящие сообщения всегда проходят (это владелец);
+    * уровень OWNER у других людей не бывает: фильтр с ним пускает только владельца;
     * без ``sender_id`` (анонимный админ канала) не проходит;
     * любая ошибка при проверке означает отказ, а не доступ.
     """

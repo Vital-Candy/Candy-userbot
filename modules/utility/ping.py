@@ -11,6 +11,7 @@ import time
 
 from core.module import Module
 from core.reply import answer
+from storage.permissions import PermissionLevel
 from utils.logger import logger
 
 SAMPLES = 3  # замеров за один вызов
@@ -52,6 +53,7 @@ class PingModule(Module):
             usage=".ping",
             priority=70,
             details=DETAILS,
+            level=PermissionLevel.USER,
         )
 
     async def stop(self) -> None:

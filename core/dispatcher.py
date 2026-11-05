@@ -13,6 +13,7 @@ from typing import Any, Awaitable, Callable
 
 from core.parser import CommandParser, ParsedCommand
 from core.reply import answer
+from storage.permissions import GRANTABLE, PermissionLevel
 from utils.logger import logger
 
 HandlerCallback = Callable[[Any], Awaitable[None] | None]
@@ -44,12 +45,18 @@ class Command:
     filters: tuple[FilterCallback, ...] = ()
     allow_incoming: bool = False
     details: str = ""  # подробная справка для ``.help <команда>`` (необязательна)
+    # Уровень по умолчанию для других людей. None: команда только для владельца и открыть её нельзя.
+    level: PermissionLevel | None = None
 
 
 # Команда, которую сейчас выполняет текущая задача: (событие, разобранная команда).
 # ContextVar безопасен для параллельных событий и не зависит от id(event).
 _current_command: contextvars.ContextVar[tuple[Any, ParsedCommand] | None] = (
     contextvars.ContextVar("candy_current_command", default=None)
+)
+# Кто вызвал текущую команду: (событие, уровень). Для сообщений владельца не заполняется.
+_current_caller: contextvars.ContextVar[tuple[Any, PermissionLevel] | None] = (
+    contextvars.ContextVar("candy_current_caller", default=None)
 )
 
 
@@ -77,6 +84,10 @@ class Dispatcher:
         self.command_timeout = command_timeout or None
         self._order = 0
         self._listeners: list[_Callable[[str], None]] = []
+        # Ручные настройки уровней: имя команды -> уровень (``owner`` закрывает команду). Их задаёт core/policy.py.
+        self.level_overrides: dict[str, str] = {}
+        # Проверка доступа для чужих сообщений: ``await gate(event, command)`` возвращает уровень или None.
+        self.gate: Callable[[Any, Command], Awaitable[PermissionLevel | None]] | None = None
 
     def add_listener(self, listener: _Callable[[str], None]) -> None:
         """Сообщает о каждом изменении набора обработчиков: ``listener(event_type)``."""
@@ -151,8 +162,13 @@ class Dispatcher:
         filters: tuple[FilterCallback, ...] = (),
         allow_incoming: bool = False,
         details: str = "",
+        level: PermissionLevel | str | None = None,
     ) -> Command:
         """``details``: подробное описание (аргументы, примеры) для ``.help <команда>``.
+
+        ``level``: уровень (user, trusted, admin), с которого команду по умолчанию могут вызывать
+        другие люди, которым этот уровень выдан. Без него команда только для владельца, и открыть
+        её через ``.perm cmd`` нельзя: команда должна быть написана с расчётом на чужие сообщения.
 
         ``allow_incoming``: команду могут вызывать и другие пользователи.
 
@@ -170,9 +186,14 @@ class Dispatcher:
             raise ValueError(
                 f"Команда .{normalized} открыта для других пользователей без фильтров доступа"
             )
+        shared: PermissionLevel | None = None
+        if level is not None:
+            shared = PermissionLevel(str(level).strip().lower())
+            if shared not in GRANTABLE:
+                raise ValueError("Уровень команды: user, trusted или admin")
         command = Command(
             normalized, callback, description, usage, priority, tuple(filters), allow_incoming,
-            details.strip(),
+            details.strip(), shared,
         )
         self.commands[normalized] = command
         return command
@@ -180,6 +201,44 @@ class Dispatcher:
     def unregister_command(self, name: str) -> None:
         """Удаляет команду по имени; несуществующая команда игнорируется."""
         self.commands.pop(name.strip().lower(), None)
+
+    def required_level(self, command: Command) -> PermissionLevel | None:
+        """Уровень, нужный другим людям для команды сейчас; None: только владелец.
+
+        Учитывает ручную настройку из ``level_overrides``; закрыть команду можно всегда,
+        а открыть только ту, у которой при регистрации указан ``level``.
+        """
+        if command.level is None:
+            return None
+        override = self.level_overrides.get(command.name)
+        if override is None:
+            return command.level
+        if override == PermissionLevel.OWNER.value:
+            return None
+        try:
+            chosen = PermissionLevel(override)
+        except ValueError:  # испорченная запись: возвращаемся к уровню по умолчанию
+            return command.level
+        return chosen if chosen in GRANTABLE else command.level
+
+    def caller_level(self, event: Any) -> PermissionLevel | None:
+        """Уровень того, кто вызвал текущую команду: OWNER для своих сообщений, иначе выданный уровень."""
+        current = _current_caller.get()
+        if current is not None and current[0] is event:
+            return current[1]
+        return PermissionLevel.OWNER if getattr(event, "out", False) else None
+
+    def visible_commands(self, level: PermissionLevel | None) -> list[Command]:
+        """Команды, доступные тому, у кого уровень ``level``: владелец видит все, остальные свои."""
+        commands = self.command_help()
+        if level == PermissionLevel.OWNER:
+            return commands
+        if level is None:
+            return []
+        return [
+            command for command in commands
+            if (needed := self.required_level(command)) is not None and level >= needed
+        ]
 
     async def dispatch(self, event_type: str, event: Any) -> None:
         """Передаёт событие обработчикам по порядку. Ошибка одного не мешает остальным.
@@ -231,12 +290,28 @@ class Dispatcher:
             return
 
         command = self.commands.get(command_data.name)
-        # Чужие сообщения молча игнорируем для закрытых команд: не раскрываем их существование.
-        if command is None or (incoming and not command.allow_incoming):
+        if command is None:
             return
+        # Свои сообщения выполняет владелец; для чужих уровень выдаёт проверка доступа (gate).
+        caller: PermissionLevel | None = None if incoming else PermissionLevel.OWNER
+        if incoming and not command.allow_incoming:
+            # Чужие сообщения молча игнорируем для закрытых команд: не раскрываем их существование.
+            if command.level is None or self.gate is None:
+                return
+            try:
+                caller = await self.gate(event, command)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Сбой проверки означает отказ, а не доступ.
+                logger.exception("Не удалось проверить доступ к команде '.%s'.", command.name)
+                return
+            if caller is None:
+                return
 
         # Команда запоминается в ContextVar, чтобы ``get_command`` работал внутри обработчика.
         token = _current_command.set((event, command_data))
+        caller_token = _current_caller.set((event, caller) if caller is not None else None)
         try:
             async with asyncio.timeout(self.command_timeout) as limit:
                 if not await self._passes_filters(command.filters, event):
@@ -259,6 +334,7 @@ class Dispatcher:
             logger.exception("Ошибка команды '.%s'.", command_data.name)
             await answer(event, f"❌ Ошибка команды .{command_data.name}. Подробности в логе.")
         finally:
+            _current_caller.reset(caller_token)
             _current_command.reset(token)
 
     @staticmethod

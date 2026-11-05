@@ -10,6 +10,7 @@ import re
 
 from core.dispatcher import Command, Dispatcher
 from core.reply import answer
+from storage.permissions import PermissionLevel
 from utils.logger import logger
 
 HELP_DETAILS = """\
@@ -19,13 +20,40 @@ HELP_DETAILS = """\
 Примеры:
 .help
 .help label
-.help account"""
+.help account
+
+Людям с выданным уровнем показываются только команды, доступные им."""
 
 STOP_DETAILS = """\
 Штатно останавливает userbot: выгружает плагины и модули, сохраняет данные и отключается от Telegram.
 Под run.sh после остановки бот не запустится сам. Чтобы запустить снова, выполните ./run.sh в терминале.
 
 Права: только владелец аккаунта."""
+
+
+_LEVEL_WORDS = {
+    PermissionLevel.USER: "user и выше",
+    PermissionLevel.TRUSTED: "trusted и выше",
+    PermissionLevel.ADMIN: "только admin",
+}
+_RIGHTS_LINE = re.compile(r"(?:\n\n|\n|^)Права:[^\n]*\s*$")
+
+
+def access_line(dispatcher: Dispatcher, command: Command) -> str:
+    """Строка «Доступ: ...» для справки: кто может вызывать команду сейчас."""
+    if command.level is None:
+        return "Доступ: только владелец аккаунта."
+    needed = dispatcher.required_level(command)
+    if needed is None:
+        return (
+            f"Доступ: сейчас только владелец (закрыто вручную; по умолчанию {_LEVEL_WORDS[command.level]}). "
+            "Вернуть: .perm cmd <команда> default"
+        )
+    manual = " (настроено вручную)" if command.name in dispatcher.level_overrides else ""
+    return (
+        f"Доступ: владелец и люди с выданным уровнем {_LEVEL_WORDS[needed]}{manual}. "
+        "Изменить: .perm cmd <команда> <user|trusted|admin|owner>"
+    )
 
 
 def with_prefix(text: str, prefix: str, names) -> str:
@@ -46,9 +74,13 @@ def help_list(commands: list[Command], prefix: str = ".") -> str:
     return with_prefix("\n".join(lines), prefix, [command.name for command in commands])
 
 
-def help_command_text(command: Command, prefix: str = ".", names=()) -> str:
-    """Полная справка по одной команде: заголовок, использование и подробное описание."""
-    return with_prefix(_command_text(command), prefix, set(names) | {command.name})
+def help_command_text(command: Command, prefix: str = ".", names=(), dispatcher: Dispatcher | None = None) -> str:
+    """Полная справка по одной команде: заголовок, использование, описание и строка доступа."""
+    text = _command_text(command)
+    if dispatcher is not None:
+        # Статичную строку «Права: ...» из описания заменяем настоящей: уровень можно менять вручную.
+        text = _RIGHTS_LINE.sub("", text).rstrip() + "\n\n" + access_line(dispatcher, command)
+    return with_prefix(text, prefix, set(names) | {command.name})
 
 
 def _command_text(command: Command) -> str:
@@ -76,7 +108,8 @@ def register_commands(dispatcher: Dispatcher, stop_callback) -> None:
 
     async def help_command(event) -> None:
         """``.help`` показывает список, ``.help <команда>`` показывает полное описание."""
-        commands = dispatcher.command_help()
+        caller = dispatcher.caller_level(event)
+        commands = dispatcher.visible_commands(caller)
         prefix = dispatcher.parser.prefix
         names = [item.name for item in commands]
         parsed = dispatcher.get_command(event)
@@ -89,7 +122,7 @@ def register_commands(dispatcher: Dispatcher, stop_callback) -> None:
             return
         command = find_command(commands, args[0], prefix)
         if command is not None:
-            await answer(event, help_command_text(command, prefix, names))
+            await answer(event, help_command_text(command, prefix, names, dispatcher))
             return
         # Опечатку подсказываем: при похожем имени пользователь исправится сразу.
         name = args[0].strip().lower().lstrip(".").lstrip(prefix)
@@ -111,6 +144,7 @@ def register_commands(dispatcher: Dispatcher, stop_callback) -> None:
         usage=".help [команда]",
         priority=100,
         details=HELP_DETAILS,
+        level=PermissionLevel.USER,
     )
     dispatcher.register_command(
         "stop",

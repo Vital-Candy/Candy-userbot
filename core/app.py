@@ -28,6 +28,7 @@ from config.settings import (
     ensure_directories,
 )
 from core.access import AccessService
+from core.policy import AccessPolicy
 from core.background import BackgroundManager
 from core.client import create_client
 from core.console import ConsoleManager
@@ -84,6 +85,7 @@ class UserbotApp:
         self._notify_tasks: set[asyncio.Task] = set()  # ссылки, чтобы уведомления не собрал сборщик мусора
         self.identity: IdentityService | None = None
         self.access: AccessService | None = None
+        self.policy: AccessPolicy | None = None
         self.storage = Storage(DATABASE_PATH)
         self.modules = ModuleManager(self)
         self.plugins = PluginManager(self, Path(__file__).resolve().parent.parent / "plugins")
@@ -227,6 +229,8 @@ class UserbotApp:
         self.events = EventBridge(self.client, self.dispatcher)
         self.identity = IdentityService(self.client)
         self.access = AccessService(self.storage.permissions, self.identity)
+        self.policy = AccessPolicy(self.access, self.storage.plugin_data, self.dispatcher)
+        self.dispatcher.gate = self.policy.gate
 
         self.storage.open()
         try:
@@ -239,6 +243,7 @@ class UserbotApp:
                     "Войдите заново: python main.py --add-account"
                 )
 
+            await self._load_policy()
             self.events.register()
             register_commands(self.dispatcher, self.stop)
             register_system_modules(self)
@@ -260,6 +265,16 @@ class UserbotApp:
         summary = failed_summary(self)
         if summary:
             await self.notify_owner(summary)
+
+    async def _load_policy(self) -> None:
+        """Читает ручные уровни команд. При сбое доступ посторонним закрывается целиком (fail-closed)."""
+        try:
+            await self.policy.load()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Не удалось прочитать настройки доступа: команды доступны только владельцу.")
+            self.dispatcher.gate = None
 
     def _task_failing(self, item) -> None:
         """Фоновая задача стала сбоить: шлёт владельцу короткое уведомление (в фоне, без ожидания)."""

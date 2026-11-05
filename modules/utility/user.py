@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from core.errors import UserError
 from core.module import Module
 from core.reply import answer
+from storage.permissions import PermissionLevel
 from modules.utility.text import clean, code
 from utils.logger import logger
 
@@ -24,6 +25,12 @@ DETAILS = """\
 .user <id или @username> — сведения без номера телефона
 .user <id или @username> --not-private — то же и номер телефона (если Telegram его показывает вам)
 .user — ответом на сообщение: про автора этого сообщения
+
+Что видит каждый уровень:
+владелец — всё, а телефон только с --not-private;
+admin и trusted — то же, но без телефона, без признаков вашей адресной книги (контакт, близкий друг, заблокирован), без общих чатов и без имени, если оно взято из ваших контактов;
+user — только ID, username, ссылка и признаки аккаунта (бот, Premium, проверенный и т. п.). Без имени, био и номера.
+Телефон и имя из ваших контактов другим не показываются никогда, флаг --not-private у них не действует.
 
 Поиск по числовому ID работает, если ваш аккаунт уже встречал этого человека (общий чат, переписка). Если пользователь у вас в контактах, Telegram отдаёт имя так, как оно записано в ваших контактах: имя из его профиля через API получить нельзя. Поэтому для контактов показывается и имя при пересылке сообщений, если Telegram его раскрывает.
 
@@ -52,6 +59,11 @@ _FLAGS = (
     ("mutual_contact", "взаимный контакт"),
     ("close_friend", "близкий друг"),
 )
+# Признаки, которые видят все уровни: описывают сам аккаунт, а не вашу адресную книгу.
+_PUBLIC_FLAGS = frozenset({"bot", "premium", "verified", "scam", "fake", "support", "deleted", "restricted"})
+
+# Что показывать кому: "owner" всё, "trusted" без личного, "user" только справочный минимум.
+VIEWS = ("owner", "trusted", "user")
 
 
 def status_text(status) -> str | None:
@@ -97,11 +109,26 @@ def _restriction(user) -> str | None:
     return ", ".join(reasons) if reasons else None
 
 
-def format_user(user, full=None, *, private: bool = False) -> str:
+def view_for(level) -> str:
+    """Вид ответа для уровня вызывающего: владелец, trusted/admin или user (всё неизвестное строже всего)."""
+    if level == PermissionLevel.OWNER:
+        return "owner"
+    if level in (PermissionLevel.TRUSTED, PermissionLevel.ADMIN):
+        return "trusted"
+    return "user"
+
+
+def format_user(user, full=None, *, private: bool = False, view: str = "owner") -> str:
     """Собирает текст ответа. ``full``: UserFull (может быть None); ``private``: показать телефон.
 
-    Поля, которых нет или которые пусты, пропускаются. Значения идут моноширинным шрифтом.
+    ``view`` ограничивает набор полей: у ``trusted`` нет телефона, общих чатов и признаков адресной
+    книги, а имя скрыто, если оно из ваших контактов; у ``user`` остаются ID, username, ссылка и
+    признаки аккаунта. Телефон показывается только владельцу. Пустые поля пропускаются.
     """
+    if view not in VIEWS:
+        view = "user"
+    owner = view == "owner"
+    private = private and owner
     full = full or SimpleNamespace()
     lines = ["👤 Информация о пользователе"]
 
@@ -115,41 +142,48 @@ def format_user(user, full=None, *, private: bool = False) -> str:
     name = " ".join(
         part for part in (getattr(user, "first_name", None), getattr(user, "last_name", None)) if part
     )
-    add("Имя", name)
-    if getattr(user, "contact", False):
+    if owner or (view == "trusted" and not getattr(user, "contact", False)):
+        add("Имя", name)  # у контакта имя взято из вашей записной книжки: другим его не отдаём
+    if owner and getattr(user, "contact", False):
         add("Имя при пересылке", getattr(full, "private_forward_name", None))
     names = _usernames(user)
     if names:
         lines.append("Username: " + ", ".join(code("@" + item) for item in names))
     add("Ссылка", f"tg://user?id={user.id}" if getattr(user, "id", None) else None)
-    add("Био", getattr(full, "about", None))
+    if view != "user":
+        add("Био", getattr(full, "about", None))
     if private:
         phone = getattr(user, "phone", None)
         lines.append("Телефон: " + (code("+" + str(phone).lstrip("+")) if phone else "скрыт или недоступен"))
-    add("Статус", status_text(getattr(user, "status", None)))
-    add("Язык", getattr(user, "lang_code", None))
-    add("День рождения", _birthday(getattr(full, "birthday", None)))
-    add("Общих чатов", getattr(full, "common_chats_count", None))
+    if view != "user":
+        add("Статус", status_text(getattr(user, "status", None)))
+        add("Язык", getattr(user, "lang_code", None))
+        add("День рождения", _birthday(getattr(full, "birthday", None)))
+    if owner:
+        add("Общих чатов", getattr(full, "common_chats_count", None))
     photo = getattr(user, "photo", None)
-    if photo is not None:
+    if photo is not None and view != "user":
         add("Дата-центр фото", getattr(photo, "dc_id", None))
-    add("Личный канал (ID)", getattr(full, "personal_channel_id", None))
-    add("Подарков в профиле", getattr(full, "stargifts_count", None))
-    add("Автоудаление сообщений (с)", getattr(full, "ttl_period", None))
+    if view != "user":
+        add("Личный канал (ID)", getattr(full, "personal_channel_id", None))
+        add("Подарков в профиле", getattr(full, "stargifts_count", None))
+        add("Автоудаление сообщений (с)", getattr(full, "ttl_period", None))
     add("Ограничение", _restriction(user))
 
-    flags = [label for attr, label in _FLAGS if getattr(user, attr, False)]
-    if getattr(full, "blocked", False):
+    flags = [
+        label for attr, label in _FLAGS if getattr(user, attr, False) and (owner or attr in _PUBLIC_FLAGS)
+    ]
+    if owner and getattr(full, "blocked", False):
         flags.append("заблокирован вами")
-    if getattr(full, "phone_calls_available", False):
+    if view != "user" and getattr(full, "phone_calls_available", False):
         flags.append("доступны звонки")
-    if getattr(full, "voice_messages_forbidden", False):
+    if view != "user" and getattr(full, "voice_messages_forbidden", False):
         flags.append("голосовые запрещены")
     if flags:
         lines.append("Признаки: " + ", ".join(clean(item) for item in flags))
 
     bot_info = getattr(full, "bot_info", None)
-    if bot_info is not None:
+    if bot_info is not None and view != "user":
         add("Описание бота", getattr(bot_info, "description", None))
         commands = [
             f"/{item.command}" for item in getattr(bot_info, "commands", None) or () if getattr(item, "command", None)
@@ -175,6 +209,7 @@ class UserModule(Module):
             usage=".user <id или @username> [--not-private]",
             priority=50,
             details=DETAILS,
+            level=PermissionLevel.USER,
         )
 
     async def stop(self) -> None:
@@ -185,7 +220,11 @@ class UserModule(Module):
         """Разбирает аргументы, находит пользователя и отвечает сведениями."""
         command = self.app.dispatcher.get_command(event)
         args = list(command.args) if command else []
+        view = view_for(self.app.dispatcher.caller_level(event))
         private = any(item.lower() == PRIVATE_FLAG for item in args)
+        if private and view != "owner":
+            await answer(event, "❌ Номер телефона показывается только владельцу аккаунта.")
+            return
         refs = [item for item in args if item.lower() != PRIVATE_FLAG]
         try:
             if len(refs) > 1 or any(item.startswith("-") for item in refs):
@@ -199,7 +238,7 @@ class UserModule(Module):
             logger.exception("Ошибка .user.")
             await answer(event, "❌ Не удалось получить сведения. Подробности в логе.")
             return
-        await answer(event, format_user(user, full, private=private))
+        await answer(event, format_user(user, full, private=private, view=view))
 
     async def _find(self, event, ref: str | None):
         """Находит пользователя по ID, username или по сообщению, на которое ответили."""

@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+from core.access import AccessService
 from core.dispatcher import Dispatcher
 from core.errors import UserError
 from modules.utility.mute import (
@@ -78,13 +79,18 @@ def make_message(message_id, *, out=False, text="", sender=2, reply_to=None, cha
 
 class MuteTests(unittest.IsolatedAsyncioTestCase):
     def build_app(self):
+        identity = SimpleNamespace(account_id=AsyncMock(return_value=7))
         return SimpleNamespace(
             dispatcher=Dispatcher(),
             client=self.client,
             storage=self.storage,
-            identity=SimpleNamespace(account_id=AsyncMock(return_value=7)),
+            identity=identity,
+            access=AccessService(self.storage.permissions, identity),
             notify_owner=AsyncMock(return_value=True),
         )
+
+    def grant(self, subject, level):
+        self.storage.permissions.grant(account_id=7, subject_id=subject, permission=level, granted_by=7)
 
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -280,6 +286,84 @@ class MuteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.module._pending, {})
         self.assertIn("не включён", self.edits[-1][2])
         self.assertEqual(self.app.dispatcher.handlers["new_message"], [])
+
+    # ------------------------------------------------ флаг уровня (-user/-trusted/-admin)
+
+    async def start_all(self, flag=""):
+        await self.command(f".mute --all {flag}".strip())
+        await self.deliver(make_message(502, out=True, text="да", reply_to=ANCHOR))
+        await self.deliver(make_message(503, out=True, text="подтверждаю", reply_to=ANCHOR))
+        self.deleted.clear()
+
+    async def test_all_without_flag_lets_only_owner_write(self):
+        self.grant(2, "admin")
+        await self.start_all()
+        await self.deliver(make_message(510, out=True, text="я"))
+        await self.deliver(make_message(511, sender=2))  # даже admin
+        await self.deliver(make_message(512, sender=3))
+        self.assertEqual(sorted(self.deleted_ids()), [511, 512])
+
+    async def test_level_flag_lets_that_level_and_above_write(self):
+        for subject, level in ((2, "user"), (3, "trusted"), (4, "admin")):
+            self.grant(subject, level)
+        await self.start_all("-trusted")
+        for number, sender in ((520, 2), (521, 3), (522, 4), (523, 5)):
+            await self.deliver(make_message(number, sender=sender))
+        self.assertEqual(sorted(self.deleted_ids()), [520, 523])  # user и без уровня удаляются
+        self.assertEqual(self.module._active[CHAT].allow, "trusted")
+        self.assertEqual(self.saved()[0]["allow"], "trusted")
+
+    async def test_each_level_flag(self):
+        for subject, level in ((2, "user"), (3, "trusted"), (4, "admin")):
+            self.grant(subject, level)
+        expected = {"-user": [530 + 3], "-trusted": [530, 533], "--admin": [530, 531, 533]}
+        for flag, gone in expected.items():
+            with self.subTest(flag=flag):
+                await self.module._finish(self.module._active[CHAT], reason="тест", quiet=True) if CHAT in self.module._active else None
+                self.deleted.clear()
+                await self.start_all(flag)
+                for number, sender in ((530, 2), (531, 3), (532, 4), (533, 5)):
+                    await self.deliver(make_message(number, sender=sender))
+                self.assertEqual(sorted(self.deleted_ids()), gone)
+
+    async def test_level_flag_in_private_chat(self):
+        self.grant(2, "trusted")
+        await self.command(".mute -trusted", is_private=True, is_group=False)
+        await self.deliver(make_message(540, sender=2, is_private=True, is_group=False))
+        await self.deliver(make_message(541, sender=3, is_private=True, is_group=False))
+        self.assertEqual(self.deleted_ids(), [541])
+
+    async def test_level_flag_needs_all_or_private_and_no_reply(self):
+        event = await self.command(".mute -user")
+        self.assertIn("с --all", event.edits[-1])
+        self.assertEqual(self.module._active, {})
+        target = make_message(300, sender=2)
+        event = await self.command(".mute --all -user", reply=target)
+        self.assertIn("нельзя совмещать", event.edits[-1])
+
+    async def test_level_flag_parse_and_restore(self):
+        self.assertEqual(parse_mute(["--all", "-admin"]).allow, "admin")
+        self.assertEqual(parse_mute(["10m", "--user", "--all"]).allow, "user")
+        for bad in (["-user", "-admin"], ["--all", "-owner"], ["off", "-user"]):
+            with self.subTest(bad=bad), self.assertRaises(UserError):
+                parse_mute(bad)
+        self.grant(2, "user")
+        await self.start_all("-user")
+        await self.module.stop()
+        again = self.make_module(self.app)
+        await again.start()
+        self.addAsyncCleanup(again.stop)
+        self.assertEqual(again._active[CHAT].allow, "user")
+        await self.deliver(make_message(550, sender=2))
+        await self.deliver(make_message(551, sender=9))
+        self.assertEqual(self.deleted_ids(), [551])
+
+    async def test_failed_level_check_deletes(self):
+        self.grant(2, "admin")
+        await self.start_all("-user")
+        self.app.access.has_level = AsyncMock(side_effect=RuntimeError("база"))
+        await self.deliver(make_message(560, sender=2))
+        self.assertEqual(self.deleted_ids(), [560])
 
     async def test_all_and_reply_cannot_be_combined(self):
         target = make_message(300, sender=2)

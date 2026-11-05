@@ -50,6 +50,7 @@ CandyUserbot/
 │   ├── plugin_api.py     # PluginAPI: учёт регистраций плагина
 │   ├── version.py        # CORE_VERSION для min_core
 │   ├── access.py         # AccessService, require(level)
+│   ├── policy.py         # AccessPolicy: барьер для чужих команд, ручные уровни команд (в базе)
 │   ├── reply.py          # answer(): ответ на команду без падений
 │   ├── summary.py        # тексты для .status и консоли
 │   ├── console.py

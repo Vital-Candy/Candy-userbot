@@ -7,6 +7,7 @@ from __future__ import annotations
 from core.health import memory_usage_mb
 from core.module import Module
 from core.reply import answer
+from storage.permissions import PermissionLevel
 from core.summary import module_lines, task_lines
 
 USAGE = "Использование: .status [all]"
@@ -36,6 +37,7 @@ class StatusModule(Module):
             usage=".status [all]",
             priority=100,
             details=DETAILS,
+            level=PermissionLevel.TRUSTED,
         )
 
     async def stop(self) -> None:
@@ -46,6 +48,10 @@ class StatusModule(Module):
         """``.status``: краткая сводка; ``.status all``: ещё список модулей и задач."""
         command = self.app.dispatcher.get_command(event)
         args = [item.lower() for item in (command.args if command else [])]
+        if self.app.dispatcher.caller_level(event) != PermissionLevel.OWNER:
+            # Чужим показываем только короткую сводку: без памяти, списка проблем, модулей и задач.
+            await answer(event, self.public_text())
+            return
         if args not in ([], ["all"]):
             await answer(event, USAGE)
             return
@@ -58,6 +64,11 @@ class StatusModule(Module):
         if args == ["all"]:
             text += "\n\n" + self.details_text()
         await answer(event, text)
+
+    def public_text(self) -> str:
+        """Короткая сводка для людей с выданным уровнем: только то, что не раскрывает внутренности."""
+        lines = self.app.health().lines()
+        return "🍬 Candy Userbot\n" + "\n".join(lines[:2])
 
     def details_text(self) -> str:
         """Подробная часть для ``.status all``: модули и фоновые задачи."""

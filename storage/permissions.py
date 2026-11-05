@@ -1,6 +1,7 @@
-"""Хранилище прав доступа (таблица permissions) и уровни USER < TRUSTED < ADMIN.
+"""Хранилище прав доступа (таблица permissions) и уровни USER < TRUSTED < ADMIN < OWNER.
 
-Используется модулем прав (.perm) для проверки, кто может вызывать команды.
+Используется модулем прав (.perm) для проверки, кто может вызывать команды. Уровень OWNER
+принадлежит только самому аккаунту: он нигде не хранится и никому не выдаётся.
 """
 from __future__ import annotations
 
@@ -12,11 +13,12 @@ from storage.models import Permission
 
 
 class PermissionLevel(StrEnum):
-    """Уровни доступа. Сравниваются по рангу (ADMIN > TRUSTED > USER), а не по строке."""
+    """Уровни доступа. Сравниваются по рангу (OWNER > ADMIN > TRUSTED > USER), а не по строке."""
 
     USER = "user"
     TRUSTED = "trusted"
     ADMIN = "admin"
+    OWNER = "owner"  # только сам аккаунт; выдать этот уровень нельзя
 
     @property
     def rank(self) -> int:
@@ -44,7 +46,15 @@ class PermissionLevel(StrEnum):
         return self.rank < other.rank
 
 
-_RANKS = {PermissionLevel.USER: 0, PermissionLevel.TRUSTED: 1, PermissionLevel.ADMIN: 2}
+_RANKS = {
+    PermissionLevel.USER: 0,
+    PermissionLevel.TRUSTED: 1,
+    PermissionLevel.ADMIN: 2,
+    PermissionLevel.OWNER: 3,
+}
+
+# Уровни, которые можно выдать другим людям.
+GRANTABLE = (PermissionLevel.USER, PermissionLevel.TRUSTED, PermissionLevel.ADMIN)
 
 
 class PermissionStore:
@@ -63,6 +73,8 @@ class PermissionStore:
     ) -> Permission:
         """Выдаёт право (повторная выдача обновляет ``granted_by`` и время). Неверный уровень: ValueError."""
         level = PermissionLevel(str(permission))
+        if level not in GRANTABLE:
+            raise ValueError("уровень owner принадлежит только самому аккаунту")
         created_at = datetime.now(timezone.utc)
         with self.db.transaction():
             self.db.execute(
@@ -95,15 +107,17 @@ class PermissionStore:
             )
         return cursor.rowcount
 
-    def highest_level(self, *, account_id: int, subject_id: int) -> PermissionLevel:
-        """Высший выданный уровень; без записей это USER."""
-        best = PermissionLevel.USER
+    def highest_level(self, *, account_id: int, subject_id: int) -> PermissionLevel | None:
+        """Высший выданный уровень; без записей ``None``: такого человека бот игнорирует."""
+        best: PermissionLevel | None = None
         for item in self.list_for_subject(account_id=account_id, subject_id=subject_id):
             try:
                 level = PermissionLevel(item.permission)
             except ValueError:  # запись от будущей версии: игнорируем, не повышаем права
                 continue
-            if level > best:
+            if level not in GRANTABLE:  # запись owner в базе не даёт ничего: владелец определяется по ID
+                continue
+            if best is None or level > best:
                 best = level
         return best
 
