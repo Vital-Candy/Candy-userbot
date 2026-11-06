@@ -47,6 +47,9 @@ class Command:
     details: str = ""  # подробная справка для ``.help <команда>`` (необязательна)
     # Уровень по умолчанию для других людей. None: команда только для владельца и открыть её нельзя.
     level: PermissionLevel | None = None
+    # Вес паузы: после этой команды чужой человек ждёт (пауза его уровня) x pause секунд.
+    # Тяжёлым командам (например отметка людей) ставят больше 1.
+    pause: float = 1.0
 
 
 # Команда, которую сейчас выполняет текущая задача: (событие, разобранная команда).
@@ -163,12 +166,15 @@ class Dispatcher:
         allow_incoming: bool = False,
         details: str = "",
         level: PermissionLevel | str | None = None,
+        pause: float = 1.0,
     ) -> Command:
         """``details``: подробное описание (аргументы, примеры) для ``.help <команда>``.
 
         ``level``: уровень (user, trusted, admin), с которого команду по умолчанию могут вызывать
         другие люди, которым этот уровень выдан. Без него команда только для владельца, и открыть
         её через ``.perm cmd`` нельзя: команда должна быть написана с расчётом на чужие сообщения.
+
+        ``pause``: вес паузы для чужих людей (от 1 до 100): базовая пауза их уровня умножается на него.
 
         ``allow_incoming``: команду могут вызывать и другие пользователи.
 
@@ -191,9 +197,11 @@ class Dispatcher:
             shared = PermissionLevel(str(level).strip().lower())
             if shared not in GRANTABLE:
                 raise ValueError("Уровень команды: user, trusted или admin")
+        if not 1 <= float(pause) <= 100:
+            raise ValueError("Вес паузы команды: от 1 до 100")
         command = Command(
             normalized, callback, description, usage, priority, tuple(filters), allow_incoming,
-            details.strip(), shared,
+            details.strip(), shared, float(pause),
         )
         self.commands[normalized] = command
         return command

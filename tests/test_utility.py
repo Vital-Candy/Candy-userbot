@@ -13,10 +13,11 @@ from core.errors import UserError
 from modules.utility.ping import PingModule, format_ping
 from modules.utility.tag import (
     MAX_ALL,
-    PER_MESSAGE,
+    MAX_LINKS,
+    MAX_TEXT,
     TagModule,
     TagRequest,
-    chunks,
+    pack,
     is_excluded,
     mention,
     parse_tag,
@@ -220,8 +221,24 @@ class TagParseTests(unittest.TestCase):
         self.assertEqual(re.fullmatch(r"\[[^\[\]()*_~|]+\]\(tg://user\?id=3\)", evil) is not None, True)
         self.assertEqual(mention(make_user(id=4, username=None, first_name="")), "[пользователь](tg://user?id=4)")
 
-    def test_chunks(self):
-        self.assertEqual(chunks(list("abcde"), 2), [["a", "b"], ["c", "d"], ["e"]])
+    def test_pack_makes_one_message_when_it_fits(self):
+        self.assertEqual(pack(["@a", "@b", "@c"]), ["@a @b @c"])
+        self.assertEqual(pack([]), [])
+
+    def test_pack_splits_by_length(self):
+        self.assertEqual(pack(["@aaa", "@bbb", "@ccc"], limit=9), ["@aaa @bbb", "@ccc"])
+        self.assertEqual(pack(["@aaa", "@bbb"], limit=9), ["@aaa @bbb"])  # ровно в предел
+        self.assertEqual(pack(["@aaa", "@bbb"], limit=8), ["@aaa", "@bbb"])
+        text = pack(["@" + "x" * 20] * 500)
+        self.assertTrue(all(len(item) <= MAX_TEXT for item in text))
+        self.assertEqual(sum(len(item.split()) for item in text), 500)
+
+    def test_pack_splits_by_number_of_links_only(self):
+        links = [f"[n](tg://user?id={n})" for n in range(5)]
+        self.assertEqual([len(item.split()) for item in pack(links, max_links=2)], [2, 2, 1])
+        mixed = ["@u1", "@u2", "@u3"] + links[:2]
+        self.assertEqual(len(pack(mixed, max_links=2)), 1)  # username не считаются ссылками
+        self.assertEqual(MAX_LINKS, 90)
 
 
 class TagCommandTests(unittest.IsolatedAsyncioTestCase):
@@ -278,13 +295,25 @@ class TagCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.sent[0][2]["parse_mode"], "md")
         event.delete.assert_awaited_once()
 
-    async def test_messages_are_chunked_with_pauses(self):
+    async def test_everyone_goes_in_one_message_without_pauses(self):
         self.client.get_participants.return_value = [make_user(id=i + 10, username=f"u{i}") for i in range(12)]
         await self.run_command(".tag all")
         await self.finish()
-        self.assertEqual(len(self.sent), 3)  # 5 + 5 + 2
-        self.assertEqual(len(self.sent[0][1].split()), PER_MESSAGE)
-        self.assertEqual(len(self.pauses), 2)
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(len(self.sent[0][1].split()), 12)
+        self.assertEqual(self.pauses, [])
+
+    async def test_long_list_is_split_only_when_needed(self):
+        self.client.get_participants.return_value = [
+            make_user(id=i + 10, username=None, first_name="Имя" + "я" * 30, last_name=str(i)) for i in range(MAX_ALL)
+        ]
+        await self.run_command(".tag all")
+        await self.finish()
+        self.assertGreater(len(self.sent), 1)
+        self.assertTrue(all(len(item[1]) <= MAX_TEXT for item in self.sent))
+        self.assertTrue(all(item[1].count("tg://user") <= MAX_LINKS for item in self.sent))
+        self.assertEqual(len(self.pauses), len(self.sent) - 1)
+        self.assertEqual(sum(item[1].count("tg://user") for item in self.sent), MAX_ALL)
 
     async def test_all_is_capped(self):
         self.client.get_participants.return_value = [make_user(id=i + 10, username=f"u{i}") for i in range(MAX_ALL + 50)]
@@ -326,7 +355,10 @@ class TagCommandTests(unittest.IsolatedAsyncioTestCase):
             await gate.wait()
 
         self.module._sleep = slow
-        self.client.get_participants.return_value = [make_user(id=i + 10, username=f"u{i}") for i in range(20)]
+        # Длинные имена: список не помещается в одно сообщение, поэтому отметка ждёт паузу между частями.
+        self.client.get_participants.return_value = [
+            make_user(id=i + 10, username=None, first_name="Имя" + "я" * 30, last_name=str(i)) for i in range(MAX_ALL)
+        ]
         await self.run_command(".tag all")
         await asyncio.sleep(0)
         again = await self.run_command(".tag all")

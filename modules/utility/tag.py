@@ -1,14 +1,13 @@
 """Команда .tag: отметить участников группы.
 
 Синтаксис: ``.tag all [-e кого пропустить]``, ``.tag rand <число> [-e ...]``, ``.tag stop``.
-Отметки уходят пачками по несколько человек с паузой. У кого есть username, пишется ``@username``,
+Все отметки уходят одним сообщением; если оно получается слишком длинным (предел Telegram), делится на несколько с паузой. У кого есть username, пишется ``@username``,
 у остальных имя со ссылкой на аккаунт. Боты, удалённые аккаунты и вы сами пропускаются.
 """
 from __future__ import annotations
 
 import asyncio
 import random
-import time
 from dataclasses import dataclass, field
 
 from core.errors import UserError
@@ -23,13 +22,12 @@ try:
 except ImportError:  # Telethon не установлен
     FloodWaitError = None
 
-PER_MESSAGE = 5  # отметок в одном сообщении
-PAUSE = 1.5  # секунд между сообщениями
+MAX_TEXT = 3900  # символов в одном сообщении (предел Telegram 4096, с запасом на разметку)
+MAX_LINKS = 90  # отметок-ссылок в одном сообщении (Telegram принимает не больше 100 элементов разметки)
+PAUSE = 1.5  # секунд между сообщениями, если пришлось делить
 MAX_ALL = 300  # больше участников за раз не отмечаем
 MAX_RAND = 100
 MAX_RAND_OTHERS = 10  # потолок для людей с выданным уровнем: отметить всех они не могут
-OTHERS_PAUSE = 60.0  # секунд между отметками одного постороннего человека (отметки идут от вашего имени)
-MAX_REMEMBERED = 200  # сколько людей помнить для этой паузы
 FETCH_LIMIT = 2000  # сколько участников максимум читать из чата
 MAX_FLOOD_WAIT = 300
 EXCLUDE_FLAGS = ("-e", "-е", "--exclude")  # вторая -е написана русской буквой: так легко ошибиться
@@ -51,9 +49,9 @@ DETAILS = f"""\
 .tag stop — остановить идущую отметку
 
 В -e можно писать @username, username или числовой ID, несколько через пробел. У кого есть username, ставится @username, у остальных имя со ссылкой на аккаунт. Боты, удалённые аккаунты и вы сами пропускаются.
-Отметки идут по {PER_MESSAGE} в сообщении с паузой {PAUSE:g} с, чтобы не поймать ограничение Telegram. В одном чате идёт одна отметка.
+Все отметки идут одним сообщением. Если не помещаются в предел Telegram (около {MAX_TEXT} символов или {MAX_LINKS} ссылок), сообщение делится на части с паузой {PAUSE:g} с. В одном чате идёт одна отметка.
 
-Людям с выданным уровнем (по умолчанию trusted и выше) доступно только .tag rand до {MAX_RAND_OTHERS} человек без -e: .tag all и .tag stop только у владельца.
+Людям с выданным уровнем (по умолчанию trusted и выше) доступно только .tag rand до {MAX_RAND_OTHERS} человек без -e: .tag all и .tag stop только у владельца. После команды им действует увеличенная пауза (см. .perm cooldown).
 
 Права: только владелец аккаунта."""
 
@@ -117,9 +115,25 @@ def mention(user) -> str:
     return f"[{name}](tg://user?id={user.id})"
 
 
-def chunks(items: list[str], size: int) -> list[list[str]]:
-    """Делит список на пачки по ``size`` элементов."""
-    return [items[i : i + size] for i in range(0, len(items), size)]
+def pack(mentions: list[str], limit: int = MAX_TEXT, max_links: int = MAX_LINKS) -> list[str]:
+    """Склеивает отметки в как можно меньше сообщений: делит, только если не влезает в ``limit``
+    символов или в ``max_links`` ссылок (у ссылок на аккаунт лимит разметки Telegram)."""
+    messages: list[str] = []
+    current: list[str] = []
+    length = links = 0
+    for item in mentions:
+        is_link = item.startswith("[")
+        extra = len(item) + (1 if current else 0)
+        if current and (length + extra > limit or (is_link and links + 1 > max_links)):
+            messages.append(" ".join(current))
+            current, length, links = [], 0, 0
+            extra = len(item)
+        current.append(item)
+        length += extra
+        links += is_link
+    if current:
+        messages.append(" ".join(current))
+    return messages
 
 
 @dataclass(slots=True)
@@ -144,8 +158,6 @@ class TagModule(Module):
         self._jobs: dict[int, TagJob] = {}
         self._sleep = asyncio.sleep  # подменяется в тестах
         self._random = random.Random()
-        self._clock = time.monotonic  # подменяется в тестах
-        self._others: dict[int, float] = {}  # когда посторонний человек в последний раз запускал отметку
 
     async def start(self) -> None:
         """Регистрирует команду ``.tag``."""
@@ -157,6 +169,7 @@ class TagModule(Module):
             priority=30,
             details=DETAILS,
             level=PermissionLevel.TRUSTED,
+            pause=20,  # отметка идёт от вашего имени: чужому ждать в 20 раз дольше базовой паузы
         )
 
     async def stop(self) -> None:
@@ -183,7 +196,7 @@ class TagModule(Module):
                     raise UserError(f"Вам доступно только: .tag rand <число до {MAX_RAND_OTHERS}>")
                 if request.count > MAX_RAND_OTHERS:
                     raise UserError(f"Не больше {MAX_RAND_OTHERS} человек за раз.")
-                self._check_pause(event)
+
             if not getattr(event, "is_group", False):
                 raise UserError("Команда работает только в группах.")
             chat_id = int(event.chat_id)
@@ -210,19 +223,6 @@ class TagModule(Module):
             raise
         except Exception as exc:
             logger.debug("Не удалось удалить сообщение с командой .tag: %s", exc)
-
-    def _check_pause(self, event) -> None:
-        """Пауза между отметками одного постороннего человека; ``UserError``, если рано."""
-        sender = getattr(event, "sender_id", None)
-        if sender is None:
-            raise UserError("Не удалось определить, кто просит отметить.")
-        now = self._clock()
-        left = OTHERS_PAUSE - (now - self._others.get(int(sender), -OTHERS_PAUSE))
-        if left > 0:
-            raise UserError(f"Подождите ещё {int(left) + 1} с.")
-        if len(self._others) >= MAX_REMEMBERED:
-            self._others = {key: moment for key, moment in self._others.items() if now - moment < OTHERS_PAUSE}
-        self._others[int(sender)] = now
 
     async def _members(self, chat_id: int, request: TagRequest) -> list:
         """Участники чата без ботов, удалённых аккаунтов, вас самих и исключённых."""
@@ -251,7 +251,7 @@ class TagModule(Module):
             users = self._random.sample(users, min(request.count, len(users)))
         else:
             users = users[:MAX_ALL]
-        return [" ".join(group) for group in chunks([mention(user) for user in users], PER_MESSAGE)]
+        return pack([mention(user) for user in users])
 
     async def _run(self, job: TagJob) -> None:
         """Отправляет сообщения с отметками по очереди; ошибку сообщает владельцу."""

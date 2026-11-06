@@ -54,6 +54,7 @@ class PingModule(Module):
             priority=70,
             details=DETAILS,
             level=PermissionLevel.USER,
+            pause=2,  # внутри три запроса к Telegram
         )
 
     async def stop(self) -> None:

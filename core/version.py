@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 # Версию читает и обновление (core/updater.py): держите строку в виде CORE_VERSION = "X.Y.Z".
-CORE_VERSION = "2.1.0"
+CORE_VERSION = "2.2.0"
 
 
 def parse_version(text: str) -> tuple[int, ...]:

@@ -40,7 +40,7 @@ class Fixture:
         self.clock = [100.0]
         self.app.policy = AccessPolicy(
             self.app.access, self.storage.plugin_data, self.app.dispatcher,
-            clock=lambda: self.clock[0], cooldown=2.0,
+            clock=lambda: self.clock[0],
         )
         self.app.dispatcher.gate = self.app.policy.gate
 
@@ -532,6 +532,86 @@ class PolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.dispatcher.level_overrides, {})
         self.assertEqual(await self.policy.set_levels(["a_user", ".A_ADMIN", "a_user"], PermissionLevel.TRUSTED), ["a_user", "a_admin"])
 
+    async def test_pause_depends_on_level_and_admin_has_one_too(self):
+        for sender, wait in ((100, 5), (101, 3), (102, 1)):
+            with self.subTest(sender=sender):
+                command = {100: "a_user", 101: "a_trusted", 102: "a_admin"}[sender]
+                self.assertTrue(await self.allowed(command, sender))
+                await self.say("." + command, sender, advance=wait - 0.1)  # чуть раньше
+                self.assertFalse(await self.allowed_now(command, sender))
+                self.fx.clock[0] += 0.2
+                self.assertTrue(await self.allowed_now(command, sender))
+
+    async def allowed_now(self, command, sender):
+        """Как allowed, но без перемотки времени."""
+        before = len(self.calls)
+        await self.say("." + command, sender, advance=0)
+        return len(self.calls) > before
+
+    async def test_command_weight_lengthens_the_pause(self):
+        self.dispatcher.register_command("heavy", self.handler, level="user", pause=20)
+        self.assertTrue(await self.allowed("heavy", 100))
+        await self.say(".a_user", 100, advance=99)  # база user 5 с x 20 = 100 с
+        self.assertEqual(len(self.calls), 1)
+        self.assertTrue(await self.allowed("a_user", 100))  # после 100 с можно
+
+    async def test_early_request_gets_one_wait_reply_per_window(self):
+        await self.say(".a_user", 100)
+        first = await self.say(".a_user", 100, advance=1)
+        second = await self.say(".a_user", 100, advance=1)
+        self.assertEqual(len(first.sent), 1)
+        self.assertIn("Подождите 4 с", first.sent[0][1])
+        self.assertEqual(second.sent, [])  # во второй раз молчим
+        later = await self.say(".a_user", 100, advance=10)
+        self.assertEqual(self.calls, [".a_user", ".a_user"])
+        self.assertTrue(later.sent)
+        again = await self.say(".a_user", 100, advance=1)  # новое окно: снова один ответ
+        self.assertIn("Подождите", again.sent[0][1])
+
+    async def test_stranger_never_gets_wait_reply(self):
+        await self.say(".a_user", STRANGER)
+        event = await self.say(".a_user", STRANGER, advance=0.1)
+        self.assertEqual(event.sent, [])
+        event = await self.say(".a_admin", 100, advance=0.1)  # нет права на команду: тоже молчим
+        self.assertEqual(event.sent, [])
+
+    async def test_cooldown_settings_are_validated_and_saved(self):
+        from core.policy import DEFAULT_COOLDOWNS
+
+        self.assertEqual(self.policy.cooldowns, DEFAULT_COOLDOWNS)
+        await self.policy.set_cooldown(PermissionLevel.USER, 30)
+        await self.policy.set_cooldown(PermissionLevel.ADMIN, 0.5)
+        for level, value in ((PermissionLevel.ADMIN, 0), (PermissionLevel.ADMIN, 0.4), (PermissionLevel.USER, 3601),
+                             (PermissionLevel.ADMIN, 31), (PermissionLevel.USER, 2), (PermissionLevel.OWNER, 5),
+                             (PermissionLevel.TRUSTED, float("nan"))):
+            with self.subTest(level=level, value=value), self.assertRaises(ValueError):
+                await self.policy.set_cooldown(level, value)
+        self.assertEqual(self.policy.cooldowns[PermissionLevel.USER], 30)
+        restarted = AccessPolicy(self.fx.app.access, self.fx.storage.plugin_data, Dispatcher())
+        await restarted.load()
+        self.assertEqual(restarted.cooldowns[PermissionLevel.USER], 30)
+        self.assertEqual(restarted.cooldowns[PermissionLevel.ADMIN], 0.5)
+        await self.policy.reset_cooldowns()
+        self.assertEqual(self.policy.cooldowns, DEFAULT_COOLDOWNS)
+        self.assertIsNone(self.fx.storage.plugin_data.get(account_id=OWNER, plugin="core.access", key="cooldowns"))
+
+    async def test_damaged_cooldown_data_falls_back_to_defaults(self):
+        from core.policy import DEFAULT_COOLDOWNS
+
+        for broken in ("текст", [1], {"user": "x", "trusted": True}, {"user": 1, "trusted": 9, "admin": 2},
+                       {"user": 99999, "admin": 0}):
+            with self.subTest(broken=broken):
+                self.fx.storage.plugin_data.set(account_id=OWNER, plugin="core.access", key="cooldowns", value=broken)
+                await self.policy.load()
+                self.assertEqual(self.policy.cooldowns, DEFAULT_COOLDOWNS)
+
+    async def test_custom_cooldown_is_used_by_the_gate(self):
+        await self.policy.set_cooldown(PermissionLevel.USER, 50)
+        self.assertTrue(await self.allowed("a_user", 100))
+        await self.say(".a_user", 100, advance=49)
+        self.assertEqual(len(self.calls), 1)
+        self.assertTrue(await self.allowed("a_user", 100, ))
+
     async def test_gate_error_denies(self):
         async def broken(event, command):
             raise RuntimeError("база недоступна")
@@ -547,8 +627,8 @@ class PolicyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_pause_table_does_not_grow_forever(self):
         for number in range(1500):
-            self.policy._remember(10_000 + number, self.fx.clock[0])
-        self.assertLessEqual(len(self.policy._last), 1000)
+            self.policy._remember(10_000 + number, self.fx.clock[0] + 10)
+        self.assertLessEqual(len(self.policy._until), 1000)
 
     async def test_caller_level_is_visible_inside_the_command(self):
         seen: list = []
@@ -789,6 +869,37 @@ class PermAccessTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(expected, text)
         await self.run_cmd(".perm revoke 300")  # ничего нет: ошибка, в журнал не попадает
         self.assertEqual(sum("снят" in item["what"] for item in await self.fx.app.policy.history(100)), 1)
+
+    async def test_cooldown_view_for_admin_change_for_owner(self):
+        text = await self.run_cmd(".perm cooldown", sender=102)
+        for expected in ("user: 5 с", "trusted: 3 с", "admin: 1 с"):
+            self.assertIn(expected, text)
+        self.assertIn("только владелец", await self.run_cmd(".perm cooldown user 9", sender=102))
+        self.assertIn("Пауза trusted: 4 с", await self.run_cmd(".perm cooldown trusted 4"))
+        self.assertIn("Пауза admin: 0.5 с", await self.run_cmd(".perm cooldown admin 0,5"))
+        self.assertIn("Пауза user: 7 с", await self.run_cmd(".perm cooldown user 7с"))
+        self.assertIn("Паузы по умолчанию", await self.run_cmd(".perm cooldown reset"))
+        self.assertIn("user: 5 с", await self.run_cmd(".perm cooldown"))
+
+    async def test_cooldown_errors(self):
+        for text, expected in (
+            (".perm cooldown admin 0", "от 0.5"),
+            (".perm cooldown user 5000", "от 0.5"),
+            (".perm cooldown user abc", "числом"),
+            (".perm cooldown user nan", "числом"),
+            (".perm cooldown owner 5", "у владельца её нет"),
+            (".perm cooldown boss 5", "уровень"),
+            (".perm cooldown admin 99", "user ≥ trusted ≥ admin"),
+            (".perm cooldown user", "использование"),
+        ):
+            with self.subTest(text=text):
+                self.assertIn(expected, await self.run_cmd(text))
+
+    async def test_cooldown_changes_are_in_audit_and_pauses_listed(self):
+        await self.run_cmd(".perm cooldown trusted 4")
+        text = await self.run_cmd(".perm audit")
+        self.assertIn("Паузы: user 5 с, trusted 4 с, admin 1 с", text)
+        self.assertIn("пауза trusted: 4 с", text)
 
     async def test_changed_level_takes_effect_immediately(self):
         sender = 100  # user

@@ -38,6 +38,7 @@ class StatusModule(Module):
             priority=100,
             details=DETAILS,
             level=PermissionLevel.TRUSTED,
+            pause=3,
         )
 
     async def stop(self) -> None:

@@ -117,8 +117,8 @@ class CommandsByLevelTests(unittest.IsolatedAsyncioTestCase):
         await self.tag.stop()
         self.fx.close()
 
-    async def run_cmd(self, text, sender, **attrs):
-        self.fx.clock[0] += 10
+    async def run_cmd(self, text, sender, *, advance=10, **attrs):
+        self.fx.clock[0] += advance
         out = sender == OWNER
         event = make_event(text, sender=sender, out=out)
         event.is_group = True
@@ -182,29 +182,32 @@ class CommandsByLevelTests(unittest.IsolatedAsyncioTestCase):
     async def test_tag_for_others_is_only_small_rand(self):
         for text in (".tag all", ".tag rand 5 -e @u2", f".tag rand {MAX_RAND_OTHERS + 1}", ".tag stop"):
             with self.subTest(text=text):
-                event = await self.run_cmd(text, 101)
+                event = await self.run_cmd(text, 101, advance=100)
                 self.assertIn("❌", self.reply_text(event))
         self.assertEqual(self.sent_tags, [])
-        event = await self.run_cmd(".tag rand 5", 101)
+        event = await self.run_cmd(".tag rand 5", 101, advance=100)
         for _ in range(50):
             await asyncio.sleep(0)
         self.assertTrue(self.sent_tags)
         self.assertEqual(sum(text.count("@u") for text in self.sent_tags), 5)
         event.delete.assert_not_awaited()  # чужое сообщение не удаляем
 
-    async def test_tag_pause_for_others_but_not_for_owner(self):
-        self.tag._clock = lambda: self.fx.clock[0]
-        first = await self.run_cmd(".tag rand 2", 101)
-        self.assertNotIn("❌", self.reply_text(first) or "")
-        second = await self.run_cmd(".tag rand 2", 101)  # прошло 10 с из 60
-        self.assertIn("Подождите", self.reply_text(second))
-        other = await self.run_cmd(".tag rand 2", 102)  # у другого человека своя пауза
-        self.assertNotIn("Подождите", self.reply_text(other) or "")
-        self.fx.clock[0] += 60
-        late = await self.run_cmd(".tag rand 2", 101)
-        self.assertNotIn("Подождите", self.reply_text(late) or "")
+    async def test_tag_has_long_pause_for_every_level_including_admin(self):
+        for sender, wait in ((101, 60), (102, 20)):  # trusted 3 с и admin 1 с, умноженные на вес 20
+            with self.subTest(sender=sender):
+                self.sent_tags.clear()
+                await self.run_cmd(".tag rand 2", sender, advance=100)
+                await self.run_cmd(".tag rand 2", sender, advance=wait - 1)
+                await asyncio.sleep(0)
+                self.assertEqual(len(self.sent_tags), 1)  # вторая заблокирована паузой
+                await self.run_cmd(".tag rand 2", sender, advance=2)
+                for _ in range(20):
+                    await asyncio.sleep(0)
+                self.assertEqual(len(self.sent_tags), 2)
+
+    async def test_owner_has_no_pause(self):
         for _ in range(3):
-            event = await self.run_cmd(".tag rand 2", OWNER)
+            event = await self.run_cmd(".tag rand 2", OWNER, advance=0)
             self.assertNotIn("Подождите", self.reply_text(event) or "")
 
     async def test_tag_for_owner_is_unchanged(self):

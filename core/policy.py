@@ -12,10 +12,16 @@
 * владелец может вручную поменять уровень открытой команды (``.perm cmd``). Настройки лежат в
   базе (каталог data), поэтому ``.update`` их не сбрасывает.
 
-Для защиты от флуда один человек может вызывать команды не чаще раза в ``COOLDOWN`` секунд.
+Пауза (перезарядка) есть у всех, кроме владельца, и зависит от уровня: чем ниже уровень, тем она
+длиннее (по умолчанию user 5 с, trusted 3 с, admin 1 с), но даже у admin она не нулевая. После
+команды человек ждёт паузу своего уровня, умноженную на вес команды (``Command.pause``: у тяжёлых
+команд он больше). Паузы настраивает владелец (``.perm cooldown``), они хранятся в базе. Если человек
+с нужным уровнем написал слишком рано, он получает один ответ «подождите», остальные сообщения
+в это окно игнорируются.
 """
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
@@ -23,6 +29,7 @@ from typing import Any
 
 from core.access import AccessService
 from core.dispatcher import Command, Dispatcher
+from core.reply import answer
 from storage.permissions import GRANTABLE, PermissionLevel
 from utils.logger import logger
 
@@ -31,7 +38,11 @@ KEY = "command_levels"
 AUDIT_KEY = "audit_log"
 MAX_AUDIT = 100  # сколько последних изменений хранить
 PROTECTED = {"perm": PermissionLevel.ADMIN}  # команды, которые нельзя опустить ниже этого уровня
-COOLDOWN = 2.0  # секунд между командами одного постороннего человека
+COOLDOWN_KEY = "cooldowns"
+# Базовая пауза по уровням: чем ниже уровень, тем длиннее; у admin она тоже есть.
+DEFAULT_COOLDOWNS = {PermissionLevel.USER: 5.0, PermissionLevel.TRUSTED: 3.0, PermissionLevel.ADMIN: 1.0}
+MIN_COOLDOWN = 0.5
+MAX_COOLDOWN = 3600.0
 MAX_TRACKED = 1000  # сколько людей помнить для паузы
 
 
@@ -45,14 +56,14 @@ class AccessPolicy:
         dispatcher: Dispatcher,
         *,
         clock: Callable[[], float] = time.monotonic,
-        cooldown: float = COOLDOWN,
     ) -> None:
         self.access = access
         self.plugin_data = plugin_data
         self.dispatcher = dispatcher
         self._clock = clock
-        self._cooldown = cooldown
-        self._last: dict[int, float] = {}
+        self.cooldowns: dict[PermissionLevel, float] = dict(DEFAULT_COOLDOWNS)
+        self._until: dict[int, float] = {}  # до какого момента человек ждёт
+        self._warned: dict[int, float] = {}  # в каком окне ожидания ему уже ответили «подождите»
 
     # ---------------------------------------------------------------- настройки
 
@@ -67,6 +78,60 @@ class AccessPolicy:
                 if isinstance(name, str) and value in allowed:
                     overrides[name] = value
         self.dispatcher.level_overrides = overrides
+        self.cooldowns = self._read_cooldowns(
+            self.plugin_data.get(account_id=account_id, plugin=PLUGIN, key=COOLDOWN_KEY, default=None)
+        )
+
+    @staticmethod
+    def _read_cooldowns(saved: Any) -> dict[PermissionLevel, float]:
+        """Паузы из базы; любая порча (не число, вне границ, нарушен порядок) возвращает значения по умолчанию."""
+        result = dict(DEFAULT_COOLDOWNS)
+        if not isinstance(saved, dict):
+            return result
+        for level in DEFAULT_COOLDOWNS:
+            value = saved.get(level.value)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            if MIN_COOLDOWN <= value <= MAX_COOLDOWN:
+                result[level] = float(value)
+        if not (result[PermissionLevel.USER] >= result[PermissionLevel.TRUSTED] >= result[PermissionLevel.ADMIN]):
+            return dict(DEFAULT_COOLDOWNS)
+        return result
+
+    async def set_cooldown(self, level: PermissionLevel, seconds: float) -> None:
+        """Задаёт базовую паузу уровня. Границы 0.5 до 3600 с; ниже уровень, пауза не короче.
+
+        Нулевой паузы нет ни у кого, даже у admin. Нарушение правил: ``ValueError``.
+        """
+        if level not in DEFAULT_COOLDOWNS:
+            raise ValueError("пауза задаётся для user, trusted и admin: у владельца её нет")
+        if not MIN_COOLDOWN <= seconds <= MAX_COOLDOWN:
+            raise ValueError(f"пауза от {MIN_COOLDOWN:g} с до {MAX_COOLDOWN:g} с")
+        updated = dict(self.cooldowns)
+        updated[level] = float(seconds)
+        if not (updated[PermissionLevel.USER] >= updated[PermissionLevel.TRUSTED] >= updated[PermissionLevel.ADMIN]):
+            raise ValueError("чем ниже уровень, тем пауза длиннее или равна: user ≥ trusted ≥ admin")
+        await self._save_cooldowns(updated)
+
+    async def reset_cooldowns(self) -> None:
+        """Возвращает паузы по умолчанию."""
+        await self._save_cooldowns(dict(DEFAULT_COOLDOWNS))
+
+    async def _save_cooldowns(self, cooldowns: dict[PermissionLevel, float]) -> None:
+        """Сохраняет паузы в базе (если они отличаются от умолчаний) и применяет."""
+        account_id = await self.access.account_id()
+        if cooldowns == DEFAULT_COOLDOWNS:
+            self.plugin_data.delete(account_id=account_id, plugin=PLUGIN, key=COOLDOWN_KEY)
+        else:
+            self.plugin_data.set(
+                account_id=account_id, plugin=PLUGIN, key=COOLDOWN_KEY,
+                value={level.value: seconds for level, seconds in cooldowns.items()},
+            )
+        self.cooldowns = cooldowns
+
+    def pause_for(self, level: PermissionLevel, command: Command) -> float:
+        """Сколько секунд ждёт человек уровня ``level`` после команды ``command``."""
+        return self.cooldowns.get(level, DEFAULT_COOLDOWNS[PermissionLevel.USER]) * command.pause
 
     async def set_level(self, name: str, level: PermissionLevel | None) -> None:
         """Задаёт уровень одной команды вручную (см. ``set_levels``)."""
@@ -150,29 +215,33 @@ class AccessPolicy:
         if sender is None:  # анонимный админ или канал
             return None
         sender = int(sender)
-        if self._too_fast(sender):
-            return None
+        until = self._until.get(sender)
+        if until is not None and self._clock() < until and self._warned.get(sender) == until:
+            return None  # уже предупредили в этом окне: молчим и базу не трогаем
         level = await self.access.level_of(sender)
         if level is None or level < needed:
+            return None  # без права посторонним не отвечаем вообще
+        # Время смотрим уже после ожидания базы: два сообщения подряд не должны пройти оба.
+        now = self._clock()
+        until = self._until.get(sender)
+        if until is not None and now < until:
+            if self._warned.get(sender) != until:
+                self._warned[sender] = until
+                await answer(event, f"⏳ Подождите {math.ceil(until - now)} с.")
             return None
-        # Повторная проверка после ожидания базы: два сообщения подряд не должны пройти оба.
-        if self._too_fast(sender):
-            return None
-        self._remember(sender, self._clock())
+        self._remember(sender, now + self.pause_for(level, command))
         return level
 
-    def _too_fast(self, sender: int) -> bool:
-        """True, если этот человек уже вызывал команду меньше ``cooldown`` секунд назад."""
-        last = self._last.get(sender)
-        return last is not None and self._clock() - last < self._cooldown
-
-    def _remember(self, sender: int, now: float) -> None:
-        """Запоминает время последней команды человека; список не растёт бесконечно."""
-        if len(self._last) >= MAX_TRACKED:
-            expired = [key for key, moment in self._last.items() if now - moment >= self._cooldown]
-            for key in expired:
-                del self._last[key]
-            if len(self._last) >= MAX_TRACKED:
-                logger.debug("Список пауз переполнен, очищаю.")
-                self._last.clear()
-        self._last[sender] = now
+    def _remember(self, sender: int, until: float) -> None:
+        """Запоминает, до какого момента человек ждёт; таблицы не растут бесконечно."""
+        if len(self._until) >= MAX_TRACKED:
+            now = self._clock()
+            for table in (self._until, self._warned):
+                for key in [key for key, moment in table.items() if moment <= now]:
+                    del table[key]
+            if len(self._until) >= MAX_TRACKED:
+                logger.debug("Таблица пауз переполнена, очищаю.")
+                self._until.clear()
+                self._warned.clear()
+        self._until[sender] = until
+        self._warned.pop(sender, None)

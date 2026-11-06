@@ -210,6 +210,7 @@ class UserModule(Module):
             priority=50,
             details=DETAILS,
             level=PermissionLevel.USER,
+            pause=2,  # внутри запросы к Telegram
         )
 
     async def stop(self) -> None:

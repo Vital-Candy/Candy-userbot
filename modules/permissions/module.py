@@ -2,7 +2,7 @@
 
 Синтаксис: ``.perm list [id]``, ``.perm grant <id | ответом> <user|trusted|admin>``,
 ``.perm revoke <id | ответом> [user|trusted|admin]``, ``.perm audit [N]``,
-``.perm cmd [<команды или номера> <уровень> | reset]``.
+``.perm cmd [<команды или номера> <уровень> | reset]``, ``.perm cooldown [<уровень> <секунды> | reset]``.
 
 Кто что может:
 
@@ -28,7 +28,8 @@ USAGE = (
     ".perm grant <id | ответом> <user|trusted|admin>\n"
     ".perm revoke <id | ответом> [user|trusted|admin]\n"
     ".perm audit [N]\n"
-    ".perm cmd [<команды или номера> <user|trusted|admin|owner|default> | reset]"
+    ".perm cmd [<команды или номера> <user|trusted|admin|owner|default> | reset]\n"
+    ".perm cooldown [<user|trusted|admin> <секунды> | reset]"
 )
 DETAILS = """\
 Кто из других людей что может. Уровни: user (самый скромный: безобидные команды вроде .ping, .help и урезанный .user) < trusted (доверенный) < admin (управляет людьми, но не аккаунтом). Уровень нужно выдать каждому человеку отдельно: у кого его нет, того userbot игнорирует. Владелец аккаунта выше всех, от этих настроек не зависит и ничем не ограничен.
@@ -55,6 +56,12 @@ DETAILS = """\
 .perm cmd <команда> default — вернуть уровень по умолчанию
 .perm cmd reset — сбросить все ручные настройки
 Если хотя бы одно имя неверное, не меняется ничего.
+
+Паузы (перезарядка между командами чужих людей):
+.perm cooldown — паузы по уровням и вес пауз у команд
+.perm cooldown trusted 4 — задать базовую паузу уровня в секундах (владелец; от 0.5 до 3600)
+.perm cooldown reset — вернуть паузы по умолчанию
+Чем ниже уровень, тем пауза длиннее или равна (user ≥ trusted ≥ admin); нулевой нет ни у кого, даже у admin. У тяжёлых команд (например .tag) пауза умножается на вес. У владельца пауз нет.
 
 Открыть можно только команды, написанные с расчётом на чужие сообщения (в списке .perm cmd). Остальные, например .update, .restart, .account, .backup, .plugin, .spam, .purge, .mute, .time, останутся только у владельца при любых настройках. Ручные настройки хранятся в каталоге data и при .update не сбрасываются.
 
@@ -112,6 +119,8 @@ class PermissionsModule(Module):
                 await self._audit(event, args[1:])
             elif action == "cmd":
                 await self._cmd(event, args[1:], caller)
+            elif action == "cooldown" and len(args) <= 3:
+                await self._cooldown(event, args[1:], caller)
             else:
                 await answer(event, USAGE)
         except ValueError as exc:
@@ -282,6 +291,55 @@ class PermissionsModule(Module):
         lines += ["", "Изменить (владелец): .perm cmd <команды или номера> <user|trusted|admin|owner|default>"]
         return "\n".join(lines)
 
+    # ------------------------------------------------------------------ паузы
+
+    def _cooldown_text(self) -> str:
+        """Паузы по уровням и команды с повышенным весом (с итоговым временем для каждого уровня)."""
+        policy = self.app.policy
+        lines = ["⏱ Паузы между командами чужих людей (у владельца их нет):"]
+        for level in GRANTABLE:
+            lines.append(f"{level.value}: {policy.cooldowns[level]:g} с")
+        heavy = sorted(
+            (item for item in self.app.dispatcher.commands.values() if item.level is not None and item.pause > 1),
+            key=lambda item: item.name,
+        )
+        if heavy:
+            lines += ["", "У тяжёлых команд пауза умножается на вес:"]
+            for item in heavy:
+                times = ", ".join(f"{level.value} {policy.pause_for(level, item):g} с" for level in GRANTABLE)
+                lines.append(f".{item.name} x{item.pause:g}: {times}")
+        lines += ["", "Изменить (владелец): .perm cooldown <user|trusted|admin> <секунды> | reset"]
+        return "\n".join(lines)
+
+    async def _cooldown(self, event, rest: list[str], caller: PermissionLevel) -> None:
+        """``.perm cooldown``: показывает паузы; владелец ещё и меняет их."""
+        if not rest:
+            await answer(event, self._cooldown_text())
+            return
+        if caller != PermissionLevel.OWNER:
+            raise ValueError("паузы меняет только владелец")
+        policy = self.app.policy
+        if len(rest) == 1 and rest[0].lower() in RESET_WORDS:
+            await policy.reset_cooldowns()
+            await self._log(event, "паузы возвращены по умолчанию")
+            await answer(event, "✅ Паузы по умолчанию.\n" + self._cooldown_text())
+            return
+        if len(rest) != 2:
+            raise ValueError("использование: .perm cooldown <user|trusted|admin> <секунды> | reset")
+        level = self._parse_level(rest[0].lower())
+        raw = rest[1].lower().replace(",", ".").removesuffix("с").removesuffix("s")
+        try:
+            seconds = float(raw)
+        except ValueError:
+            raise ValueError("секунды нужно записать числом, например 2 или 0.5") from None
+        if seconds != seconds or seconds in (float("inf"), float("-inf")):  # nan и бесконечность
+            raise ValueError("секунды нужно записать числом, например 2 или 0.5")
+        if level is None:
+            raise ValueError("уровень: user, trusted или admin")
+        await policy.set_cooldown(level, seconds)
+        await self._log(event, f"пауза {level.value}: {seconds:g} с")
+        await answer(event, f"✅ Пауза {level.value}: {seconds:g} с.\n" + self._cooldown_text())
+
     # ------------------------------------------------------------------ аудит
 
     async def _audit(self, event, rest: list[str]) -> None:
@@ -313,6 +371,8 @@ class PermissionsModule(Module):
                 more = f" и ещё {len(ids) - LIST_LIMIT}" if len(ids) > LIST_LIMIT else ""
                 lines.append(f"{level.value} ({len(ids)}): {shown}{more}")
 
+        pauses = ", ".join(f"{level.value} {self.app.policy.cooldowns[level]:g} с" for level in GRANTABLE)
+        lines += ["", f"Паузы: {pauses}"]
         shareable = self._shareable()
         manual = [item for item in shareable if item.name in dispatcher.level_overrides]
         lines += ["", f"Команд открыто другим: {len(shareable)}, настроено вручную: {len(manual)}"]
