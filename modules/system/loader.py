@@ -8,6 +8,7 @@ from modules.system.plugins import PluginsModule
 from modules.system.prefix import PrefixModule
 from modules.system.restart import RestartModule
 from modules.system.status import StatusModule
+from modules.system.store import StoreModule
 from modules.system.update import UpdateModule
 from modules.clock.loader import register_clock_modules
 from modules.spam.loader import register_spam_modules
@@ -24,6 +25,7 @@ def register_system_modules(app) -> None:
     app.modules.register(BackupModule(app))
     app.modules.register(PluginsModule(app))
     app.modules.register(UpdateModule(app))
+    app.modules.register(StoreModule(app))
     app.modules.register(RestartModule(app))
     app.modules.register(PrefixModule(app))
     register_storage_modules(app)

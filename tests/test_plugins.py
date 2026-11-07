@@ -493,7 +493,7 @@ class CoreVersionTests(unittest.IsolatedAsyncioTestCase):
 
 class ExamplePluginTests(unittest.IsolatedAsyncioTestCase):
     async def test_shipped_example_works(self):
-        example = Path(__file__).resolve().parent.parent / "plugins" / "example.py.disabled"
+        example = Path(__file__).resolve().parent.parent / "store" / "plugins" / "example.py"
         fx = Fixture()
         try:
             fx.write("example", example.read_text(encoding="utf-8"))

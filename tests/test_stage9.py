@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -206,6 +207,31 @@ class PublishScriptTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertTrue((self.home / ".candy-publish" / "mine.txt").exists())
 
+    def test_store_index_is_rebuilt_in_published_copy(self) -> None:
+        index = self.src / "store" / "index.json"
+        index.write_text('{"schema": 1, "plugins": {}}\n', encoding="utf-8")  # устарел
+        result = self.run_publish("--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        published = json.loads((self.work / "store" / "index.json").read_text(encoding="utf-8"))
+        self.assertIn("example", published["plugins"])
+        self.assertEqual(json.loads(index.read_text(encoding="utf-8"))["plugins"], {})  # исходная папка не тронута
+
+    def test_broken_store_plugin_blocks_publication(self) -> None:
+        (self.src / "store" / "plugins" / "broken.py").write_text("def create_plugin(:\n", encoding="utf-8")
+        result = self.run_publish("--dry-run")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("индекс магазина", result.stderr)
+
+    def test_user_plugins_never_get_published(self) -> None:
+        (self.src / "plugins" / "mine.py").write_text("X = 1\n", encoding="utf-8")
+        (self.src / "plugins" / "other.txt").write_text("x", encoding="utf-8")
+        result = self.run_publish("--dry-run")
+        listing = subprocess.run([GIT, "ls-files"], cwd=self.work, capture_output=True, text=True).stdout
+        self.assertNotIn("plugins/mine.py", listing)  # .gitignore не пускает
+        self.assertTrue(result.returncode != 0 or "plugins/other.txt" not in listing)
+        self.assertIn("plugins/__init__.py", listing)
+        self.assertIn("store/plugins/example.py", listing)
+
     def test_real_run_requires_forbidden_file(self) -> None:
         self.forbidden.unlink()
         result = self.run_publish()
@@ -394,6 +420,7 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("git clone https://example.invalid/Candy-Userbot.git", calls)
         self.assertIn("pip -m pip install -r requirements.txt", calls)
         self.assertIn("check", calls)
+        self.assertIn("sparse-checkout set --no-cone /* !/store/", calls)  # плагины магазина не устанавливаются
         self.assertTrue((target / "run.sh").exists())
         self.assertIn("./run.sh", result.stdout)
 

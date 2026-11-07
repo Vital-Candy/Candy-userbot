@@ -35,7 +35,8 @@ CandyUserbot/
 │   ├── health.py         # HealthReport: ok / degraded / down
 │   ├── doctor.py         # python main.py --check
 │   ├── menu.py           # терминальное меню (ANSI, без библиотек)
-│   ├── updater.py        # обновление из GitHub: проверка, замена, откат
+│   ├── updater.py        # обновление из GitHub: проверка, замена, откат (store/ не устанавливается)
+│   ├── store.py          # магазин плагинов: индекс, проверка SHA-256, установка, откат, удаление
 │   ├── client.py
 │   ├── events.py
 │   ├── dispatcher.py
@@ -74,6 +75,8 @@ CandyUserbot/
 ├── run.sh                # супервизор: перезапуск только после кода 1
 ├── installer.sh          # установка в Termux/Linux: git clone + зависимости + проверка
 ├── tools/publish.sh      # безопасная публикация на GitHub: чистая история, анонимный автор
+├── tools/build_store_index.py  # пересборка store/index.json по store/plugins/*.py
+├── store/                # магазин плагинов (в репозитории; в установленный userbot не попадает)
 ├── logo.txt              # ASCII-логотип для меню (необязателен, не затирается обновлением)
 ├── assets/               # картинки репозитория
 ├── LICENCE               # Apache 2.0

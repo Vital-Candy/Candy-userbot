@@ -48,6 +48,9 @@ TIMEOUT = 30.0  # таймаут сетевого запроса, секунды
 
 # Никогда не перезаписываются и не удаляются обновлением.
 PROTECTED = frozenset({"data", "logs", "plugins", ".env", ".git", "__pycache__"})
+# Каталоги репозитория, которые в установленный userbot не копируются: магазин плагинов
+# скачивается отдельно (команда .store), а не вместе с ядром.
+NOT_INSTALLED = frozenset({"store"})
 # Личные файлы: если такой уже есть у пользователя, обновление его не перезаписывает.
 KEEP_LOCAL = ("logo.txt",)
 
@@ -243,6 +246,8 @@ class Updater:
         if found != expected:
             raise UpdateError(f"Версия в архиве ({found}) не совпадает с объявленной ({expected}).")
         for path in sorted(tree.rglob("*.py")):
+            if path.relative_to(tree).parts[0] in NOT_INSTALLED:
+                continue  # плагины магазина в установку не входят и ядро обновлению не мешают
             try:
                 compile(path.read_bytes(), str(path.relative_to(tree)), "exec")
             except (SyntaxError, ValueError) as exc:
@@ -257,7 +262,7 @@ class Updater:
             if not path.is_file():
                 continue
             relative = path.relative_to(tree)
-            if relative.parts[0] in PROTECTED or "__pycache__" in relative.parts:
+            if relative.parts[0] in PROTECTED or relative.parts[0] in NOT_INSTALLED or "__pycache__" in relative.parts:
                 continue
             if len(relative.parts) == 1 and relative.name in KEEP_LOCAL and (self.root / relative).exists():
                 continue
@@ -268,7 +273,7 @@ class Updater:
         """Локальные файлы внутри пакетов, которых больше нет в новой версии."""
         stale = []
         for entry in sorted(tree.iterdir()):
-            if not entry.is_dir() or entry.name in PROTECTED:
+            if not entry.is_dir() or entry.name in PROTECTED or entry.name in NOT_INSTALLED:
                 continue
             local_dir = self.root / entry.name
             if not local_dir.is_dir():

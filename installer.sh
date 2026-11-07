@@ -77,6 +77,8 @@ elif [ -e "$CANDY_DIR" ]; then
 else
     info "Скачиваю проект..."
     git clone "$CANDY_REPO" "$CANDY_DIR" || fail "Не удалось скачать репозиторий: $CANDY_REPO"
+    # Плагины магазина (store/) в установку не входят: их ставят отдельно командой .store в Telegram.
+    (cd "$CANDY_DIR" && { git sparse-checkout set --no-cone '/*' '!/store/' >/dev/null 2>&1 || rm -rf store; })
 fi
 
 cd "$CANDY_DIR" || fail "Не удалось открыть $CANDY_DIR"

@@ -164,6 +164,13 @@ fi
 git config user.name "$AUTHOR_NAME"
 git config user.email "$AUTHOR_EMAIL"
 git config commit.gpgsign false
+
+# Индекс магазина плагинов пересобирается из store/plugins/*.py, чтобы суммы всегда совпадали с файлами.
+# Сами плагины уходят в репозиторий только в store/: установленный userbot их не получает (см. README).
+if [ -d store/plugins ]; then
+    command -v python3 >/dev/null 2>&1 || die "для индекса магазина плагинов нужен python3."
+    python3 tools/build_store_index.py || die "индекс магазина плагинов не собран: исправьте плагин в store/plugins."
+fi
 git add -A
 
 # --- Проверки перед коммитом ---------------------------------------------------------
@@ -171,7 +178,7 @@ FOUND=0
 report() { FOUND=1; printf 'НАЙДЕНО: %s\n' "$1" >&2; }
 
 # 1. Файлы, которых в публикации быть не должно.
-bad_paths="$(git -c core.quotepath=off ls-files | grep -Ei '(^|/)(data|logs|downloads|backups?)/|(^|/)\.env($|\.)|\.session|profile\.json|\.zip$|\.bak$|sqlite|\.db$|\.log$|\.pem$|\.key$|\.p12$|\.pyc$|(^|/)\.candy-' | grep -Ev '(^|/)\.env\.example$' || true)"
+bad_paths="$(git -c core.quotepath=off ls-files | grep -Ei '(^|/)(data|logs|downloads|backups?)/|^plugins/|(^|/)\.env($|\.)|\.session|profile\.json|\.zip$|\.bak$|sqlite|\.db$|\.log$|\.pem$|\.key$|\.p12$|\.pyc$|(^|/)\.candy-' | grep -Ev '(^|/)\.env\.example$|^plugins/__init__\.py$' || true)"
 if [ -n "$bad_paths" ]; then
     report "личные или служебные файлы:"
     printf '%s\n' "$bad_paths" >&2

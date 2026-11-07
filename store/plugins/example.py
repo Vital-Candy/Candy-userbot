@@ -1,5 +1,5 @@
-# Переименуйте в example.py, чтобы попробовать plugin API.
-# Загрузка и выгрузка без перезапуска: .plugin load example / .plugin reload example
+# Пример плагина: команда .hello и фоновая задача. Ставится из магазина: .store install example
+# Загрузка и выгрузка без перезапуска: .plugin unload example / .plugin reload example
 from __future__ import annotations
 
 from core.plugin import Plugin

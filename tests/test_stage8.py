@@ -263,6 +263,21 @@ class UpdaterTests(unittest.TestCase):
         self.assertEqual((self.root / "logs/candy.log").read_text(), "log")
         self.assertEqual((self.root / "logo.txt").read_text(), "MY LOGO\n")
 
+    def test_store_is_not_installed_and_cannot_break_the_update(self):
+        broken = "def broken(:\n"  # плагин магазина с ошибкой синтаксиса ядру не мешает
+        archive = make_zip(good_tree(**{"store/index.json": "{}", "store/plugins/x.py": broken}))
+        self.updater(FakeFetch("1.1.0", archive)).apply()
+        self.assertFalse((self.root / "store").exists())
+        self.assertTrue((self.root / "core/new.py").exists())
+
+    def test_existing_local_store_folder_is_left_alone(self):
+        (self.root / "store").mkdir()
+        (self.root / "store/mine.txt").write_text("моё", encoding="utf-8")
+        archive = make_zip(good_tree(**{"store/new.txt": "x"}))
+        self.updater(FakeFetch("1.1.0", archive)).apply()
+        self.assertEqual((self.root / "store/mine.txt").read_text(encoding="utf-8"), "моё")
+        self.assertFalse((self.root / "store/new.txt").exists())
+
     def test_apply_removes_stale_package_files_and_backs_them_up(self):
         result = self.updater().apply()
         self.assertFalse((self.root / "core/old_module.py").exists())

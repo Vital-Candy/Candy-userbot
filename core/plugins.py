@@ -227,6 +227,14 @@ class PluginManager:
         for name in reversed(tuple(self._order)):
             await self.unload(name)
 
+    def forget(self, name: str) -> bool:
+        """Убирает из реестра выгруженный плагин, чей файл удалён. False, если плагин ещё загружен или файл на месте."""
+        state = self._plugins.get(name)
+        if state is None or state.loaded or state.path.exists():
+            return False
+        del self._plugins[name]
+        return True
+
     def states(self) -> list[PluginState]:
         """Состояния всех известных плагинов (копия списка)."""
         return list(self._plugins.values())

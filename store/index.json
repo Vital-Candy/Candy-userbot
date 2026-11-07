@@ -1,0 +1,13 @@
+{
+  "plugins": {
+    "example": {
+      "description": "Пример: команда .hello и фоновая задача",
+      "min_core": "0.6",
+      "requires": [],
+      "sha256": "4dde33ac64a8f62fb45f7124d1300fab763f90af07360ce7b6de50288dcc8b87",
+      "size": 1608,
+      "version": "1.0.0"
+    }
+  },
+  "schema": 1
+}
